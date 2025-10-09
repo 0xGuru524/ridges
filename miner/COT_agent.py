@@ -12,11 +12,10 @@ from collections import defaultdict
 import urllib.request as _urlreq
 
 #--------------------------Constants-------------------------------
-GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
 KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct-0905"
 DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
 QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
-AGENT_MODELS = [GLM_MODEL_NAME, KIMI_MODEL_NAME, DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]
+AGENT_MODELS = [KIMI_MODEL_NAME, DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]
 PROBLEM_TYPE_CREATE = "CREATE"
 PROBLEM_TYPE_FIX = "FIX"
 DEFAULT_PROXY_URL = os.getenv('SANDBOS_PROXY_URL', 'http://sandbox_proxy')
@@ -1741,106 +1740,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         else: 
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.BUG_REPORT_REQUIRED.name, qa_response.get("analysis", ""))
 #------------------------Core Classes------------------------------
-def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
-    retry = 0
-    code_generation_messages = [
-        {
-            "role": "system",
-            "content": GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT
-        },
-        {
-            "role": "user",
-            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
-        }
-    ]
-    while retry < 10:
-        try:
-            logger.info(f"[MULTI_STEP] Attempt {retry + 1}/10")
-            code_response = EnhancedNetwork.make_request(code_generation_messages, model=KIMI_MODEL_NAME)
-            loop_check_messages = [
-                {
-                    "role": "system",
-                    "content": INFINITE_LOOP_CHECK_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": f"Generated Code:\n{code_response}\n\nAnalyze this code for potential infinite loops and provide a corrected version if any issues are found. Return ONLY the final Python code.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
-                }   
-            ]
-            loop_check_response = EnhancedNetwork.make_request(loop_check_messages, model=QWEN_MODEL_NAME)
-            logger.info(f"[MULTI_STEP] Loop check completed ({len(loop_check_response)} chars)")
-            solution = loop_check_response.strip()
-            if solution.startswith('```python'):
-                solution = solution[9:]
-            if solution.startswith('```'):
-                solution = solution[3:]
-            if solution.endswith('```'):
-                solution = solution[:-3]
-            solution = solution.strip()
-            lines = solution.split("\n")
-            first_line = lines[0].strip() if lines else ""
-            if lines[0].endswith(".py") == False:
-                retry += 1
-                code_generation_messages.append({"role": "assistant", "content": code_response})
-                code_generation_messages.append({"role": "user", "content": f"Include file name in the response. example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"})
-                print(f"Retrying because the first line is not a python file name:\n {solution}")
-                continue
-            logger.info(f"[MULTI_STEP] Success: {len(lines)} lines, filename: '{first_line}'")
-            return solution
-        except Exception as e:
-            retry += 1
-            print(f"Exception in generate_solution_with_multi_step_reasoning: {e}")
-            time.sleep(2)
-    if retry >= 10:
-        logger.error("[MULTI_STEP] Failed after 10 attempts")
-        return ""
-    return ""
-def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
-    retry = 0
-    while retry < 10:
-        try:
-            logger.info("Starting multi-step reasoning solution generation")
-            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton)
-            if solution:
-                logger.info("Generated initial solution successfully using multi-step reasoning")
-                return solution
-            else:
-                logger.warning("Multi-step reasoning failed, falling back to single-step approach")
-                messages = [
-                    {
-                        "role": "system",
-                        "content": GENERATE_INITIAL_SOLUTION_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files."""
-                    }
-                ]
-                response = EnhancedNetwork.make_request(messages, model=KIMI_MODEL_NAME)
-                messages.append(
-                    {"role": "user", "content": f"""This is a initial solution for this problem. Check it and if you find some errors or bugs, fix it."""},
-                    {"role": "assistant", "content" : response}
-                )
-                response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
-                solution = response.strip()
-                if solution.startswith('```python'):
-                    solution = solution[9:]
-                if solution.startswith('```'):
-                    solution = solution[3:]
-                if solution.endswith('```'):
-                    solution = solution[:-3]
-                solution = solution.strip()
-                
-                logger.info("Generated initial solution successfully using fallback approach")
-                return solution
-        except Exception as e:
-            logger.error(f"Error generating initial solution: {str(e)}")
-            retry += 1
-            time.sleep(2)
-    if retry >= 10:
-        logger.error("Failed to generate initial solution")
-        return ""
-    return ""
 def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
     retry = 0
     test_generation_messages = [
@@ -1935,127 +1834,6 @@ def generate_test_files(problem_statement: str, files_to_test: str, code_skeleto
         logger.error("Failed to generate initial solution")
         return ""
     return ""
-def fix_lazy_property_generation(problem_statement: str, initial_solution: str) -> str:
-    try:
-        if "class " not in initial_solution:
-            logger.info("No class found in solution, skipping")
-            return initial_solution
-
-        detection_messages = [
-            {
-                "role": "system",
-                "content": "You are a Python code expert. Analyze if this problem requires lazy property generation. Look for properties that should generate values when accessed but currently just return stored values. Return only 'YES' or 'NO'."
-            },
-            {
-                "role": "user", 
-                "content": f"Problem statement:\n{problem_statement}\n\nCurrent solution:\n{initial_solution}\n\nDoes this problem require lazy property generation where properties should generate values when accessed if they don't exist?"
-            }
-        ]
-        
-        detection_response = EnhancedNetwork.make_request(detection_messages, model=QWEN_MODEL_NAME)
-        needs_fix = "YES" in detection_response.upper()
-        
-        if not needs_fix:
-            logger.info("[LAZY_PROPERTY_FIX] Problem does not need lazy property generation fix, skipping")
-            return initial_solution
-            
-        logger.info("[LAZY_PROPERTY_FIX] Problem needs lazy property generation fix, applying LLM-based fix")
-        
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a Python code expert. Fix the lazy property generation issues. Properties should generate values when accessed if they don't exist. Return ONLY the complete corrected Python code with filename. Do not include any explanations, comments, or markdown formatting."
-            },
-            {
-                "role": "user", 
-                "content": f"Problem statement:\n{problem_statement}\n\nCurrent solution:\n{initial_solution}\n\nRewrite the solution to use instance-level tracking only. Remove all class-level tracking. Use _past_names as instance variable. Do not call reset() in __init__. Implement lazy property generation. Return ONLY the corrected Python code with filename, no explanations. Do not include any explanations, comments, or markdown formatting."
-            }
-        ]
-        
-        response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
-        logger.info(f"[LAZY_PROPERTY_FIX] LLM response received ({len(response)} chars)")
-        
-        fixed_solution = response.strip()
-        if fixed_solution.startswith('```python'):
-            fixed_solution = fixed_solution[9:]
-        if fixed_solution.startswith('```'):
-            fixed_solution = fixed_solution[3:]
-        if fixed_solution.endswith('```'):
-            fixed_solution = fixed_solution[:-3]
-        fixed_solution = fixed_solution.strip()
-        
-        lines = fixed_solution.split('\n')
-        first_line = lines[0].strip() if lines else ""
-        
-        logger.info(f"[LAZY_PROPERTY_FIX] Fixed solution first line: '{first_line}'")
-        logger.info(f"[LAZY_PROPERTY_FIX] Fixed solution length: {len(fixed_solution)} chars")
-        
-        if first_line.endswith('.py'):
-            logger.info("[LAZY_PROPERTY_FIX] Successfully applied LLM-based lazy property fix")
-            return fixed_solution
-        else:
-            logger.warning(f"[LAZY_PROPERTY_FIX] Format validation failed - first line: '{first_line}', using original")
-            return initial_solution
-            
-    except Exception as e:
-        logger.error(f"[LAZY_PROPERTY_FIX] LLM-based fix failed: {e}, using original")
-        return initial_solution
-
-
-def fix_recursive_word_definitions(problem_statement: str, initial_solution: str) -> str:
-    try:
-        if "class " not in initial_solution:
-            logger.info("No class found in solution, skipping")
-            return initial_solution
-        detection_messages = [
-            {
-                "role": "system",
-                "content": "You are a programming expert. Analyze if this problem requires fixing recursive definition issues. Look for code that handles definitions that can reference themselves, causing infinite loops during execution. Return only 'YES' or 'NO'."
-            },
-            {
-                "role": "user", 
-                "content": f"Problem statement:\n{problem_statement}\n\nCurrent solution:\n{initial_solution}\n\nDoes this problem have recursive definition issues where definitions can reference themselves, causing infinite loops during execution-time expansion?"
-            }
-        ]
-        detection_response = EnhancedNetwork.make_request(detection_messages, model=QWEN_MODEL_NAME)
-        needs_fix = "YES" in detection_response.upper()
-        if not needs_fix:
-            logger.info("[RECURSIVE_DEFINITION_FIX] Problem does not need recursive definition fix, skipping")
-            return initial_solution
-        logger.info("[RECURSIVE_DEFINITION_FIX] Definition patterns detected, applying LLM-based fix")
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a programming expert. Fix recursive definition issues in the evaluator. The problem is that when a definition references itself, the current expansion logic creates infinite loops. Fix this by properly handling recursive definitions during definition time, not execution time. IMPORTANT: Do NOT prevent recursive definitions - they should be allowed and handled correctly. CRITICAL: Return ONLY the corrected Python code with filename, no explanations, comments, or markdown formatting. Do not use ```python or ``` blocks."
-            },
-            {
-                "role": "user", 
-                "content": f"Problem statement: {problem_statement}\n\nCurrent solution: {initial_solution}\n\nFix the recursive definition issue. Follow these steps: STEP 1: PROBLEM - Current solution has infinite loops when definitions reference themselves - Must handle recursive definitions properly STEP 2: REQUIREMENTS - Recursive definitions must be ALLOWED and handled correctly - Do NOT raise errors for recursive definitions - Do NOT add conditions that prevent self-reference STEP 3: SOLUTION - Process definitions during definition time, not execution time - Create flattened version by expanding references - If reference points to same word being defined, keep it as-is - If reference points to different word, expand it recursively STEP 4: EXECUTION - When encountering defined word, prepend its flattened definition to input stream - Use simple prepending approach - Do NOT replace entire token list or reset index STEP 5: ARCHITECTURE - Process definitions line by line first, then execute only the last line - Separate definition phase from execution phase completely - Use simple prepending approach - Do NOT use complex token list manipulation or index reset STEP 6: VALIDATION - Check if word name is a number (positive or negative) using try/except approach - If conversion succeeds, it's a number - raise error immediately - If conversion fails, it's not a number - continue normally - Use simple logic: try conversion, if successful then raise error, if exception then continue Return ONLY the corrected Python code with filename, no explanations, no markdown formatting, no ``` blocks."
-            }
-        ]
-        response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
-        logger.info(f"[RECURSIVE_DEFINITION_FIX] LLM response received ({len(response)} chars)")
-        fixed_solution = response.strip()
-        if fixed_solution.startswith('```python'):
-            fixed_solution = fixed_solution[9:]
-        if fixed_solution.startswith('```'):
-            fixed_solution = fixed_solution[3:]
-        if fixed_solution.endswith('```'):
-            fixed_solution = fixed_solution[:-3]
-        fixed_solution = fixed_solution.strip()
-        lines = fixed_solution.split('\n')
-        first_line = lines[0].strip() if lines else ""
-        logger.info(f"[RECURSIVE_DEFINITION_FIX] Fixed solution first line: '{first_line}'")
-        logger.info(f"[RECURSIVE_DEFINITION_FIX] Fixed solution length: {len(fixed_solution)} chars")
-        if first_line.endswith('.py'):
-            logger.info("[RECURSIVE_DEFINITION_FIX] Successfully applied LLM-based recursive definition fix")
-            return fixed_solution
-        else:
-            logger.warning(f"[RECURSIVE_DEFINITION_FIX] Format validation failed - first line: '{first_line}', using original")
-            return initial_solution
-    except Exception as e:
-        logger.error(f"[RECURSIVE_DEFINITION_FIX] LLM-based fix failed: {e}, using original")
-        return initial_solution
 def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
     created_files = []
     if not initial_solution.strip():
@@ -2346,26 +2124,6 @@ def fix_task_solve_workflow(problem_statement: str, code_skeleton: str, *, timeo
     patch = tool_manager.get_final_git_patch()
     logger.info(f"Final Patch Generated..: Length: {len(patch)}")
     return patch
-#------------------------Type Checker------------------------------
-def check_problem_type(problem_statement: str) -> str:
-    retry = 0
-    while retry < 10:
-        try:
-            messages = [
-                {'role': 'system', 'content': PROBLEM_TYPE_CHECK_PROMPT},
-                {'role': 'user', 'content':f'{problem_statement}\n# Project Tree Structure: \n{get_directory_tree()}'}
-            ]
-            response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
-            if response not in [PROBLEM_TYPE_CREATE, PROBLEM_TYPE_FIX]:
-                retry += 1
-            else:
-                break
-        except Exception as e:
-            logger.error(f'Error: {e}')
-            retry += 1
-        time.sleep(2)
-    return response
-#------------------------Type Checker------------------------------
 #----------------------------Init----------------------------------
 def ensure_git_initialize():
     logger.info('Starting git initialization check...')
