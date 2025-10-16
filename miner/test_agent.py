@@ -43,11 +43,11 @@ RUN_ID = os.getenv("RUN_ID", "")
 REPO_DIR = ""
 DEBUG_MODE = True
 
-GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
+GLM_MODEL_NAME = "zai-org/GLM-4.6-FP8"
 KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
 DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
 QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
-AGENT_MODELS=[QWEN_MODEL_NAME, DEEPSEEK_MODEL_NAME, KIMI_MODEL_NAME, GLM_MODEL_NAME]
+AGENT_MODELS=[GLM_MODEL_NAME, QWEN_MODEL_NAME, DEEPSEEK_MODEL_NAME, KIMI_MODEL_NAME]
 MAX_FIX_TASK_STEPS = 400
 
 PROBLEM_TYPE_CHECK_PROMPT = textwrap.dedent(
@@ -305,8 +305,294 @@ contents of test_b.py
 ```
 """
 )
+MAIN_COT_REASONING_PROMPT=textwrap.dedent("""
+# Role: Expert Coding Assistant 🚀
 
+## Context
+You are operating at the root of a Python repository. Your mission is to systematically analyze and fix coding issues using comprehensive reasoning and available tools.
+As a first step, find the relevant files in the repo to work on.
 
+## Core Workflow (Chain of Thought)
+
+### Phase 1: Deep Analysis & Understanding
+1. **Problem Comprehension**: 
+   - Analyze the problem statement thoroughly
+   - Compare expected vs actual outputs from test cases
+   - Identify the core issue and success criteria
+   - Note: Solutions must align with most relevant test case expectations
+
+2. **Codebase Exploration**:
+   - Use `search_in_all_files_content` for initial discovery across repository
+   - Follow with `search_in_specified_file_v2` for focused file analysis
+   - Use `get_file_content` with line filtering for precise examination
+   - Map code structure using `get_functions` and `get_classes`
+
+3. **Root Cause Investigation**:
+   - Examine file contents to localize problematic code
+   - Trace execution flow and data transformations
+   - Identify exact location and nature of the bug
+   - Use `run_code` to reproduce issues if needed
+
+### Phase 2: Multi-Solution Design
+1. **Solution Generation**:
+   - Brainstorm at least 2 meaningfully different approaches
+   - Each solution must completely address the root cause
+   - Consider implementation complexity and risk
+   - Ensure solutions produce output closest to test case expectations
+
+2. **Impact Assessment**:
+   - Analyze how each solution affects existing functionality
+   - Ensure backward compatibility unless explicitly waived
+   - Identify edge cases and boundary conditions
+   - Plan testing strategy for each solution
+
+### Phase 3: Approval & Implementation
+1. **Solution Presentation**:
+   - Use `get_approval_for_solution` with detailed solution comparisons
+   - Select best solution based on test case alignment
+   - Provide clear reasoning for selection
+
+2. **Systematic Implementation**:
+   - After approval, use `apply_code_edit` for precise changes
+   - Apply fixes to ALL identified locations in codebase
+   - Maintain consistency across multiple files
+   - Use iterative search-apply-verify cycles
+
+### Phase 4: Validation & Quality Assurance
+1. **Testing Strategy**:
+   - Use `run_repo_tests` to validate existing functionality
+   - Use `generate_test_function` for focused bug reproduction tests
+   - Use `run_code` for custom validation scenarios
+   - Ensure all relevant test cases pass
+
+2. **Final Verification**:
+   - Re-check all modified files for consistency
+   - Confirm no unintended side effects
+   - Validate solution meets all requirements
+   - Use `finish` with comprehensive investigation summary
+
+## Critical Principles
+
+### Multi-File Awareness
+- **Never stop at first match** - use iterative searches until all instances found
+- **Consistent changes** - ensure uniform modifications across codebase
+- **Cross-file impact** - consider dependencies between files
+
+### Solution Quality Standards
+- **Minimal changes**: Fix issue with least necessary modifications
+- **Backward compatibility**: Maintain unless explicitly required otherwise
+- **Test alignment**: Solutions must match expected output in relevant test cases
+- **Elegance**: Prefer clean, maintainable approaches
+
+### Tool Compliance
+- **Always get approval** before using `apply_code_edit`
+- **Never create test files** with `save_file`
+- **Use `generate_test_function`** for test creation needs
+- **Validate syntax** - all modifications are syntax-checked
+
+## Solution Presentation Format
+
+When using `get_approval_for_solution`, structure solutions as:
+
+**Solution 1: [Descriptive Name]**
+- **Approach**: High-level strategy and implementation details
+- **Files Modified**: Complete list with specific changes
+- **Edge Cases Handled**: Specific scenarios addressed
+- **Test Alignment**: How it matches expected outputs
+- **Pros**: Advantages and elegance
+- **Cons**: Potential drawbacks
+
+**Solution 2: [Descriptive Name]**
+- [Same detailed structure]
+
+**Selection Reasoning**: Clear explanation why chosen solution best matches test case expectations
+
+## Quality Checklist
+Before seeking approval, verify:
+- [ ] At least 2 meaningfully different solutions developed
+- [ ] All relevant files identified through comprehensive searching
+- [ ] Solutions align with test case expected outputs
+- [ ] Backward compatibility maintained
+- [ ] Edge cases properly handled
+- [ ] Changes are minimal and focused
+- [ ] Implementation plan is precise and testable
+
+## Execution Mindset
+- **Be systematic**: Follow CoT framework rigorously
+- **Be thorough**: Leave no code path unexamined
+- **Be precise**: Use exact text matching for edits
+- **Be collaborative**: Present clear options for approval
+- **Be quality-focused**: Prioritize solutions that best match test expectations
+""")
+
+TOOL_PROMPT = textwrap.dedent("""
+# TOOL KNOWLEDGE BASE
+
+## Available Tools & Their Purposes:
+
+### File Operations
+**get_file_content(file_path: str, search_start_line: int = None, search_end_line: int = None, search_term: str = None)->str**
+- Retrieves file contents with optional filtering
+- Can extract specific line ranges or filter by search term
+- Use: When you need targeted examination of file contents
+- Note: Only works with Python files
+
+**save_file(file_path: str, content: str)->str**
+- Writes text content to specified filesystem location
+- Rejects edits with syntax errors
+- Use: For making code changes after approval
+- Important: Do not use to create test files
+
+### Code Analysis & Search
+**search_in_all_files_content(search_term: str, case_sensitive: bool = False) -> str**
+- Searches for text patterns across all .py files (excluding test files)
+- Use: Initial discovery of relevant code across entire repository
+- Output: File paths and line numbers where pattern was found
+
+**search_in_specified_file_v2(file_path: str, search_term: str)->str**
+- Locates text patterns within a specific Python file
+- Use: Deep analysis of identified files
+- Output: Matching locations with line numbers
+
+**get_functions(function_paths: List[str])->Dict[str, str]**
+- Extracts function definitions using full paths (e.g., "file.py::class::function")
+- Use: Understanding specific function implementations
+- Output: Dictionary of function paths to function bodies
+
+**get_classes(class_paths: List[str])->Dict[str, str]**
+- Extracts class definitions using full paths (e.g., "file.py::class")
+- Use: Understanding class structures and hierarchies
+- Output: Dictionary of class paths to class bodies
+
+### Execution & Testing
+**run_code(content:str,file_path:str)->str**
+- Executes Python code by saving to file and running
+- Use: Testing changes, reproducing issues, validating fixes
+- Important: Only use for execution, not for permanent test creation
+- Note: May fail due to missing dependencies
+
+**run_repo_tests(file_paths:List[str])->str**
+- Runs tests for specific repository files
+- Use: Validating that changes don't break existing tests
+- Output: stdout/stderr from test execution
+
+**generate_test_function(file_path: str, test_function_code: str, position: str = "append") -> str**
+- Creates or appends test functions to test files
+- Use: Creating focused tests for bug reproduction or validation
+- Important: Generated tests are excluded from final patch
+- Position options: "append", "top", "after_imports", "before_main", "auto"
+
+### Solution Management
+**get_approval_for_solution(solutions:list[str],selected_solution:int,reason_for_selection:str)->str**
+- Presents solutions to user for approval
+- Requires at least 2 meaningfully different solutions
+- Selection criteria: Closest to expected output in most relevant test case
+- Use: Before implementing any major changes
+- Output: approval/not_approved
+
+**apply_code_edit(file_path:str, search:str, replace:str)->str**
+- Performs targeted text replacement in source files
+- Rejects edits with syntax errors
+- Use: After receiving approval for solution
+- Important: Only exact text patterns can be replaced
+
+### Workflow Control
+**start_over(problem_with_old_approach:str,new_apprach_to_try:str)**
+- Reverts all changes and restarts analysis
+- Use: When current approach is fundamentally flawed
+- Requires: Explanation of previous issues and new strategy
+
+**finish(investigation_summary: str)**
+- Signals completion of workflow
+- Requires detailed summary in format:
+  Problem: <problem_statement>
+  Investigation: <investigation_summary>  
+  Solution: <your_solution>
+
+## Tool Usage Patterns:
+
+### Discovery Flow:
+1. `search_in_all_files_content()` → Broad repository search
+2. `search_in_specified_file_v2()` → File-specific pattern matching
+3. `get_file_content()` → Targeted content extraction
+4. `get_functions()`/`get_classes()` → Structural analysis
+
+### Solution Flow:
+1. `get_approval_for_solution()` → Present 2+ solutions for approval
+2. `apply_code_edit()` → Make precise changes after approval
+3. `run_code()`/`run_repo_tests()` → Validate changes
+4. `finish()` → Complete workflow
+
+### Testing Flow:
+1. `generate_test_function()` → Create focused tests
+2. `run_repo_tests()` → Execute relevant tests
+3. `run_code()` → Custom validation code
+
+## Critical Constraints:
+- **Approval Required**: Use `get_approval_for_solution` before `apply_code_edit`
+- **No Test Creation**: Don't use `save_file` for test files
+- **Python Only**: Most tools work only with Python files
+- **Syntax Checking**: Modification tools validate syntax
+""")
+DYNAMIC_TOOL_SELECTION_PROMPT=textwrap.dedent(
+"""
+# Dynamic Tool Selection Guide
+
+## Based on Task Phase:
+
+### Exploration & Discovery:
+**When starting investigation:**
+- `search_in_all_files_content()` - Find all occurrences across repository
+- `search_in_specified_file_v2()` - Deep dive into specific files
+- `get_file_content()` - Examine files with optional line filtering
+
+**When understanding code structure:**
+- `get_functions()` - Analyze specific function implementations
+- `get_classes()` - Examine class hierarchies and methods
+
+### Solution Development:
+**When designing fixes:**
+- `run_code()` - Test hypotheses and reproduce issues
+- `generate_test_function()` - Create focused tests for validation
+
+**When ready to implement:**
+- `get_approval_for_solution()` - REQUIRED before any code changes
+- `apply_code_edit()` - Make precise text replacements after approval
+
+### Validation & Completion:
+**When testing changes:**
+- `run_repo_tests()` - Validate existing test suites
+- `run_code()` - Execute custom validation scenarios
+- `generate_test_function()` - Add protective tests
+
+**When finished:**
+- `finish()` - Submit comprehensive summary
+
+## Critical Tool Combinations:
+
+### Complete Bug Fix Workflow:
+1. `search_in_all_files_content()` → Find all relevant code
+2. `get_file_content()` → Examine specific implementations  
+3. `get_approval_for_solution()` → Get approval for 2+ solutions
+4. `apply_code_edit()` → Implement approved changes
+5. `run_repo_tests()` → Validate no regressions
+6. `finish()` → Complete with summary
+
+### Complex Multi-file Issues:
+1. Iterative searches until all occurrences found
+2. Structural analysis with `get_functions`/`get_classes`
+3. Comprehensive solution presentation for approval
+4. Consistent application across all files
+5. Full test suite validation
+
+## Important Reminders:
+- ✅ Always use `get_approval_for_solution` before `apply_code_edit`
+- ✅ Use `generate_test_function` for test creation, never `save_file`
+- ✅ Solutions must align with test case expected outputs
+- ✅ Perform comprehensive multi-file searches
+- ✅ Provide detailed investigation summaries in `finish`
+"""
+)
 FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
 # Hey there! You're a Coding Assistant 🚀. I have uploaded all files of a python repository. Your current working directory is at the root of that repo. You will be provided with a problem statement and you need to make the necessary changes to fix the issue.
 
@@ -347,10 +633,6 @@ You have access to the following tools:-
 FIX_TASK_INSTANCE_PROMPT_TEMPLATE = textwrap.dedent("""
 # Now let's start. Here is the problem statement:
 {problem_statement}
-Problem requirement document:
-{requirement}
-Problem Architecture:
-{architecture}
 """)
 
 
@@ -390,8 +672,6 @@ Generate a comprehensive, well-structured requirement analysis document by syste
 
 ### CODE SKELETON:
 {code_skeleton}
-
-**Confirmed Task Type:** {task_type}
 
 ## DOCUMENT STRUCTURE REQUIREMENTS
 
@@ -589,8 +869,6 @@ Analyze the technical constraints and design an implementation architecture that
 
 **Validated Requirements:**
 {requirement_document}
-
-**Confirmed Task Type:** {task_type}
 
 ## MANDATORY ANALYSIS FRAMEWORK
 
@@ -3294,7 +3572,18 @@ def generate_solution_with_multi_step_reasoning(problem_statement: str, code_ske
     ]
     while retry < 10:
         try:
-            code_response = EnhancedNetwork.make_request(code_generation_messages, model=QWEN_MODEL_NAME)
+            code_response = EnhancedNetwork.make_request(code_generation_messages, model=KIMI_MODEL_NAME)
+            loop_check_messages = [
+                {
+                    "role": "system",
+                    "content": INFINITE_LOOP_CHECK_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": f"Generated Code:\n{code_response}\n\nAnalyze this code for potential infinite loops and provide a corrected version if any issues are found. Return ONLY the final Python code.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
+                }   
+            ]
+            code_response = EnhancedNetwork.make_request(loop_check_messages, model=QWEN_MODEL_NAME)
 
             solution = code_response.strip()
             if solution.startswith('```python'):
@@ -3753,11 +4042,10 @@ def process_create_task(input_dict):
     problem_statement = input_dict.get("problem_statement", "")
     problem_statement = post_process_instruction(problem_statement)
     code_skeleton = get_code_skeleton()
-    def requirement_analysis(proplem_statement: str, code_skeleton: str) -> str:
+    def requirement_analysis(problem_statement: str, code_skeleton: str) -> str:
         prompt = REQUIREMENT_ANALYSIS_PROMPT.format(
         problem_statement=problem_statement,
-        code_skeleton=code_skeleton,
-        task_type="CREATE"
+        code_skeleton=code_skeleton
             )
         messages = [
             {"role": "system", "content": "You are a expert software requirements analyst. Generate comprehensive, well-structured requirement documents that are immediately actionable for development teams."},
@@ -3771,8 +4059,7 @@ def process_create_task(input_dict):
         prompt = ARCHITECTURE_ANALYSIS_PROMPT.format(
             problem_statement=problem_statement,
             code_skeleton=code_skeleton,
-            requirement_document=requirement,
-            task_type="CREATE"
+            requirement_document=requirement
             )
         messages = [
         {
@@ -3808,9 +4095,7 @@ def process_create_task(input_dict):
         instance_id="",
         test_runner=f"unittest",
         test_runner_mode="FILE",
-        n_max_steps=100,
-        requirement=requirement,
-        architecture=architecture
+        n_max_steps=100
     )
 
     if patch is None:
@@ -4040,8 +4325,7 @@ def process_fix_task(input_dict: Dict[str, Any]):
     def requirement_analysis(proplem_statement: str, code_skeleton: str) -> str:
         prompt = REQUIREMENT_ANALYSIS_PROMPT.format(
         proplem_statement=proplem_statement,
-        code_skeleton=code_skeleton,
-        task_type="FIX"
+        code_skeleton=code_skeleton
             )
         messages = [
             {"role": "system", "content": "You are a expert software requirements analyst. Generate comprehensive, well-structured requirement documents that are immediately actionable for development teams."},
@@ -4111,7 +4395,7 @@ def process_fix_task(input_dict: Dict[str, Any]):
             return ""
 
 def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str, instance_id: str = "", \
-    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS, requirement: str="", architecture: str="") -> tuple[str, List[str], List[str]]:
+    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
     global run_id
     run_id=run_id_1
     cot=EnhancedCOT()
@@ -4135,9 +4419,10 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
         test_runner_mode=test_runner_mode
     )
     logger.info(f"Starting main agent execution...")
-    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(),format_prompt=FORMAT_PROMPT_V0)
-    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement, requirement="", architecture="")
-    
+    system_prompt = MAIN_COT_REASONING_PROMPT
+    tool_prompt = TOOL_PROMPT
+    dynamictoolselection = DYNAMIC_TOOL_SELECTION_PROMPT
+    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)    
     start_time = time.time()
     logs: List[str] = []
     logs.append(f"cwd: {os.getcwd()}")
@@ -4152,13 +4437,13 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
 
         messages: List[Dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
+                {"role": "system", "content": tool_prompt},
+                {"role": "system", "content": dynamictoolselection},
+                {"role": "system", "content": STOP_INSTRUCTION},
                 {"role": "user", "content": instance_prompt},
+                
             ]
-        
         messages.extend(cot.to_str())
-
-        messages.append({"role": "system", "content": STOP_INSTRUCTION})
-    
         if cot.is_thought_repeated():
             logger.info(f"[TEST_PATCH_FIND] Thought repeated, adding DO NOT REPEAT TOOL CALLS instruction")
             last_thought = cot.thoughts[-1]
