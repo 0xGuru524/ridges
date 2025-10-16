@@ -1,4 +1,3 @@
-#I don't like GPT
 from __future__ import annotations
 import ast
 import json
@@ -10,7 +9,7 @@ import textwrap
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, NamedTuple
 from json import JSONDecodeError
 import re
 import inspect
@@ -19,68 +18,36 @@ from enum import Enum
 import json
 import csv
 import logging
-import unittest
-from uuid import UUID, uuid4
+from uuid import uuid4
+import urllib.request as _urlreq
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
+import math
 
 PROBLEM_TYPE_CREATE = "CREATE"
 PROBLEM_TYPE_FIX = "FIX"
 
+PROBLEM_LANGUAGE_PYTHON = "python"
+
 DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://sandbox_proxy")
-DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "2000"))
+DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "1800"))
 MAX_TEST_PATCH_TIMEOUT = int(os.getenv("MAX_STEPS_TEST_PATCH_FIND", "400"))
 
-GLM_MODEL_NAME ="GLM-4.5-Air" "zai-org/GLM-4.5-FP8"
+# Embedding configuration
+MAX_EMBED_TOKENS = 128000  # Reduced from 512000 for faster processing
+MAX_EMBED_CHARS = MAX_EMBED_TOKENS * 4  # reserve but we'll split by tokens
+EMBED_MODEL_NAME = "agentica-org/DeepCoder-14B-Preview"
+USE_FUNCTION_CHUNKS = os.getenv("EMBED_WHOLE_FILES", "0") != "1"
+RUN_ID = os.getenv("RUN_ID", "")
+REPO_DIR = ""
+DEBUG_MODE = True
+
+GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
 KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
 DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
 QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
-AGENT_MODELS=[QWEN_MODEL_NAME, DEEPSEEK_MODEL_NAME, KIMI_MODEL_NAME, GLM_MODEL_NAME]
+AGENT_MODELS=[GLM_MODEL_NAME, KIMI_MODEL_NAME, DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]
 MAX_FIX_TASK_STEPS = 400
-
-DEBUG_MODE=True
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-FORMAT_PROMPT_V0=textwrap.dedent("""
-**📝 Response Format Requirements**
-
-1. **Strict Triplet Format**:
-   - `next_thought`: Detailed reasoning (include:
-     - Problem understanding
-     - Code analysis
-     - Solution justification
-     - Validation plan)
-   - `next_tool_name`: Must be an exact tool name from the tool list
-   - `next_tool_args`: Valid JSON with:
-     - Proper escaping
-     - No trailing commas
-     - Tool-specific parameters
-
-2. **Error Handling Format**:
-   - For errors: 
-     next_thought: "Error: [detailed explanation]"
-     next_tool_name: ""
-     next_tool_args: {}
-
-3. **Example Valid Format**:
-   next_thought: "I'll fix the JSON parsing issue by adding proper error handling and validation"
-   next_tool_name: "apply_code_edit"
-   next_tool_args: {
-     "file_path": "network.py",
-     "search": "return json.loads(response)",
-     "replace": "try:\n    return json.loads(response)\nexcept JSONDecodeError:\n    logger.error(f'Invalid JSON: {{response}}')\n    raise"
-   }
-
-4. **Invalid Format Examples** (Avoid These):
-   - Missing any of the three required fields
-   - JSON syntax errors in next_tool_args
-   - Extra text outside the triplet format
-   - Using incorrect tool names
-   - Not quoting special characters properly
-""")
-
-
 
 PROBLEM_TYPE_CHECK_PROMPT = textwrap.dedent(
 '''
@@ -93,6 +60,33 @@ Only respond with the "FIX" or "CREATE".
 '''
 )
 
+ONESHOT_SYSTEM_PROMPT = """
+You are an autonomous programmer. The user will provide a bug report or 
+feature request (the "problem") plus a compact summary of the most 
+relevant repository files.  Your job is to return ONE *valid* unified 
+diff patch that fixes the problem. If you have any questions, do not ask the user. 
+Instead, solve it to the best of your ability with the knowledge you have.
+
+You will be provided with a summary of the repository files that are most relevant to the problem.
+Your patch must be valid and apply cleanly when run from the repository root.
+
+STRICT FORMAT RULES
+1. Return *only* the diff – no prose, no Markdown back-ticks.
+2. The diff must start with 'diff --git a/<path> b/<path>' followed by 
+   the standard "--- a/<path>" and "+++ b/<path>" headers.
+3. Use -u style context hunks that begin with lines like @@ -N,M +N,M @@.
+4. Every changed file needs its own header block as in rule 2.
+5. End the patch with a trailing newline.
+
+Be exact: if the diff is syntactically malformed or wrapped in extra 
+text the automated patch tool will fail.
+
+OUTPUT RULES (VERY IMPORTANT, STRICT)
+• You MUST end your reply with a *raw* JSON object with "code_response" property – nothing else.
+• Must hold the unified diff from rules 1-5 *verbatim*.
+Example: {"code_response": "diff --git a/foo.py b/foo.py\n..."}
+"""
+
 DO_NOT_REPEAT_TOOL_CALLS=textwrap.dedent("""
 You're not allowed to repeat the same tool call with the same arguments.
 Your previous response: 
@@ -100,45 +94,6 @@ Your previous response:
 
 Try to use something different!
 """)
-
-
-
-REJECTION_FEEDBACK_PROMPT = f"ERROR: Reject tool call - this exact tool call with same arguments was already attempted {{consecutive_rejections}} times. You're trying the same tool {{next_tool_name}} with identical arguments. This suggests you may be stuck in a loop. Please try a different approach:\n" \
-    "1. Update the arguments or use a different tool entirely\n" \
-    "2. Think differently, and try to use a different approach to solve the problem\n"
-
-STOP_INSTRUCTION=textwrap.dedent("""
-# 🎨 
-DO NOT generate `observation:` in your response. It will be provided by user for you.
-Generate only SINGLE triplet of `next_thought`, `next_tool_name`, `next_tool_args` in your response.
-""")
-
-
-GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
-"""
-You are an expert Python developer. Your task is to generate a complete, working Python solution for the given problem statement.
-
-Strict Requirements:
-1. Output the full content of Python files along with their file names. You **MUST** output the **file name** along with file content.
-2. Do not include explanations, comments, or markdown formatting.
-3. Use only standard Python (no external libraries).
-4. Implement all required classes and functions exactly with the same names as in the initial code stub.
-5. You may add helper functions or classes if needed, but do not remove or rename the original ones.
-6. Ensure the solution handles all edge cases, validates inputs, and produces correct outputs.
-7. The solution must be executable as-is with no placeholders or TODOs.
-8. If problem statement doesn't explicitly requires a list of strings as a response, do not use list of strings for multiline text problems, just use raw string format.
-Return only the final Python code.
-
-Response Examples:
-```python
-a.py
-{content}
-
-b.py
-{content}
-```
-"""
-)
 
 GENERATE_INITIAL_SOLUTION_PROMPT = textwrap.dedent("""
 You are an expert Python developer. Your task is to generate a complete, working Python solution for the given problem statement.
@@ -197,6 +152,82 @@ contents of b.py
 """
 )
 
+
+MULTILINE_CHECK_PROMPT = textwrap.dedent("""
+You are an expert code reviewer specializing in multiline text detection and prevention. Your task is to analyze the generated Python code for potential multiline text issues and provide a corrected version if issues are found.
+
+1. If problem statement is not related to mutliline text response, just return the original code unchanged
+2. Otherwise:
+    - If problem statement doesn't explicitely requires a list of strings as a response, do not use list of strings for multiline text problems, just use raw string format.
+        example:
+        ```text
+        a1
+        b1
+        ```
+        you should use:
+        "a1\nb1"
+    - If problem statement requires a list of strings as a response, use list of strings for multiline text problems.
+        example:
+        ```text
+        [
+            "a1",
+            "[EMPTY_LINE],
+            "n1"
+        ]
+        ```
+        you should use:
+        ["a1", "\n", "n1"]
+
+If you find potential multiline text issues:
+- Provide a corrected version of the code
+- Ensure the code is not using multiline text
+
+If no multiline text issues are detected:
+- Return the original code unchanged
+
+Your response should be in JSON format, with the following keys:
+- feedback: explain the feedback in very detail.
+- code: full code
+    - STRICT REQUIREMENT: Return the final Python code along with file names. Do not include any explanations, comments, or additional text.
+
+Respose Example:
+{
+    "feedback": "updating code due to sth",
+    "code": '''
+    ```python
+    a.py
+    contents of a.py
+    ```
+    '''
+}
+"""
+)
+
+GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
+"""
+You are an expert Python developer. Your task is to generate a complete, working Python solution for the given problem statement.
+
+Strict Requirements:
+1. Output the full content of Python files along with their file names. You **MUST** output the **file name** along with file content.
+2. Do not include explanations, comments, or markdown formatting.
+3. Use only standard Python (no external libraries).
+4. Implement all required classes and functions exactly with the same names as in the initial code stub.
+5. You may add helper functions or classes if needed, but do not remove or rename the original ones.
+6. Ensure the solution handles all edge cases, validates inputs, and produces correct outputs.
+7. The solution must be executable as-is with no placeholders or TODOs.
+8. If problem statement doesn't explicitely requires a list of strings as a response, do not use list of strings for multiline text problems, just use raw string format.
+Return only the final Python code.
+
+Response Examples:
+```python
+a.py
+{content}
+
+b.py
+{content}
+```
+"""
+)
 
 GENERATE_INITIAL_TESTCASES_PROMPT = textwrap.dedent("""
 You are an expert Python testcase developer. Your task is to generate a complete testcases for the given problem statement.
@@ -276,7 +307,7 @@ contents of test_b.py
 
 
 FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
-# Hey there! Act as a export Coding Assistant and Full stack developer🚀. I have uploaded all files of a python repository. Your current working directory is at the root of that repo. You will be provided with a problem statement and you need to make the necessary changes to fix the issue.
+# Hey there! You're a Coding Assistant 🚀. I have uploaded all files of a python repository. Your current working directory is at the root of that repo. You will be provided with a problem statement and you need to make the necessary changes to fix the issue.
 
 ## Follow these steps to fix the issue:
 1. As a first step, find the relevant files in the repo to work on.
@@ -336,6 +367,460 @@ Output should be one of MODULE or FILE, No other texts are allowed.
 """)
 
 
+STOP_INSTRUCTION=textwrap.dedent("""
+# 🎨 
+DO NOT generate `observation:` in your response. It will be provided by user for you.
+Generate only SINGLE triplet of `next_thought`, `next_tool_name`, `next_tool_args` in your response.
+""")
+REQUIREMENT_ANALYSIS_PROMPT = textwrap.dedent("""
+# REQUIREMENT ANALYSIS DOCUMENT
+
+## INSTRUCTION
+Generate a comprehensive, well-structured requirement analysis document by systematically analyzing the provided problem statement and code skeleton. The output must be a complete, professional document that can be directly used for software development planning.
+
+## INPUT DATA
+
+### PROBLEM STATEMENT:
+{problem_statement}
+
+### CODE SKELETON:
+{code_skeleton}
+
+## DOCUMENT STRUCTURE REQUIREMENTS
+
+The output must follow this exact structure with all sections completed:
+
+### 1. EXECUTIVE SUMMARY
+- Brief overview of the problem domain
+- Primary objectives of the solution
+- Key technical challenges identified
+- Overall scope boundaries
+
+### 2. FUNCTIONAL REQUIREMENTS SPECIFICATION
+
+#### 2.1 Core Functional Requirements
+- List each functional requirement with unique identifier (FR-001, FR-002, etc.)
+- Each requirement must be testable, specific, and measurable
+- Include priority classification (P0: Critical, P1: Important, P2: Optional)
+
+#### 2.2 Input/Output Specifications
+- Detailed input requirements and formats
+- Expected output specifications and formats
+- Data validation requirements
+- Error conditions and handling expectations
+
+#### 2.3 Business Rules
+- Specific business logic requirements
+- Decision points and conditional logic
+- Calculation rules and formulas
+- Validation rules and constraints
+
+### 3. TECHNICAL CONSTRAINTS DOCUMENTATION
+
+#### 3.1 Interface Constraints
+- Complete list of function signatures that must be preserved
+- Parameter types and return value specifications
+- Class interfaces and method contracts
+- Any decorators or annotations that must remain
+
+#### 3.2 Architectural Constraints
+- Code organization patterns that must be followed
+- Module structure and import dependencies
+- Inheritance hierarchies and class relationships
+- Existing design patterns to maintain
+
+#### 3.3 Environmental Constraints
+- Programming language and version requirements
+- Library and dependency restrictions
+- Platform and runtime environment constraints
+- Performance and resource limitations
+
+### 4. ACCEPTANCE CRITERIA DEFINITION
+
+#### 4.1 Success Scenarios
+- Primary success paths with expected behaviors
+- Normal operation test cases
+- Standard input/output validation cases
+
+#### 4.2 Edge Case Scenarios
+- Boundary condition test cases
+- Extreme input value handling
+- Resource exhaustion scenarios
+- Concurrency and timing issues (if applicable)
+
+#### 4.3 Failure Scenarios
+- Error condition test cases
+- Invalid input handling requirements
+- Exception handling and recovery expectations
+- Graceful degradation requirements
+
+### 5. QUALITY ATTRIBUTES SPECIFICATION
+
+#### 5.1 Performance Requirements
+- Response time expectations
+- Throughput requirements
+- Resource utilization limits
+- Scalability considerations
+
+#### 5.2 Reliability Requirements
+- Availability expectations
+- Fault tolerance requirements
+- Recovery time objectives
+- Data integrity requirements
+
+#### 5.3 Maintainability Requirements
+- Code documentation standards
+- Testing coverage expectations
+- Modularity and extensibility requirements
+- Code style and formatting standards
+
+#### 5.4 Security Requirements
+- Input sanitization requirements
+- Data protection needs
+- Access control considerations
+- Vulnerability prevention measures
+
+### 6. RISK ASSESSMENT AND MITIGATION
+
+#### 6.1 Technical Risks
+- Complexity-related risks
+- Integration challenges
+- Performance risks
+- Technology limitation risks
+
+#### 6.2 Requirement Risks
+- Ambiguity in requirements
+- Conflicting requirements
+- Missing requirement identification
+- Scope creep potential
+
+#### 6.3 Implementation Risks
+- Algorithmic complexity risks
+- Resource constraint risks
+- Timeline and scheduling risks
+- Dependency management risks
+
+#### 6.4 Risk Mitigation Strategies
+- Specific mitigation approaches for each identified risk
+- Contingency planning
+- Validation and verification strategies
+- Monitoring and adjustment mechanisms
+
+### 7. ASSUMPTIONS AND DEPENDENCIES
+
+#### 7.1 Explicit Assumptions
+- Documented assumptions about unclear requirements
+- Environmental assumptions
+- User behavior assumptions
+- Data quality assumptions
+
+#### 7.2 Technical Dependencies
+- Library and framework dependencies
+- External service dependencies
+- Platform and infrastructure dependencies
+- Integration point dependencies
+
+#### 7.3 External Dependencies
+- Third-party service requirements
+- API dependencies and contracts
+- Data source dependencies
+- Compliance and regulatory dependencies
+
+### 8. VALIDATION AND VERIFICATION PLAN
+
+#### 8.1 Testing Strategy
+- Unit testing approach
+- Integration testing strategy
+- System testing methodology
+- Acceptance testing criteria
+
+#### 8.2 Quality Assurance Measures
+- Code review requirements
+- Static analysis expectations
+- Performance testing approach
+- Security testing requirements
+
+#### 8.3 Success Metrics
+- Quantitative success indicators
+- Qualitative success measures
+- Performance benchmarks
+- User acceptance criteria
+
+## DOCUMENT QUALITY REQUIREMENTS
+
+- Each section must be complete with no placeholder text
+- Requirements must be specific, measurable, achievable, relevant, and testable (SMART)
+- Technical specifications must be precise and unambiguous
+- All code skeleton constraints must be explicitly documented
+- Risk assessment must be comprehensive and realistic
+- The document must be actionable for development teams
+
+## FORMATTING STANDARDS
+
+- Use clear, professional language
+- Maintain consistent numbering and heading hierarchy
+- Include specific examples where appropriate for clarity
+- Ensure all technical terms are properly defined
+- Document must be self-contained and comprehensive
+
+## OUTPUT
+
+Generate the complete requirement analysis document following the specified structure. Ensure all sections are thoroughly completed with detailed, actionable content that directly addresses the provided problem statement and code skeleton.
+""")
+ARCHITECTURE_ANALYSIS_PROMPT = textwrap.dedent("""
+# SOFTWARE ARCHITECTURE ANALYST
+
+## PRIMARY OBJECTIVE
+Analyze the technical constraints and design an implementation architecture that satisfies all functional requirements while strictly adhering to the provided code skeleton's interfaces and patterns.
+
+## INPUT DATA
+**Problem Statement:**
+{problem_statement}
+
+**Code Skeleton Structure:**
+{code_skeleton}
+
+**Validated Requirements:**
+{requirement_document}
+
+**Confirmed Task Type:** {task_type}
+
+## MANDATORY ANALYSIS FRAMEWORK
+
+### 1. IMMUTABLE ARCHITECTURAL CONSTRAINTS IDENTIFICATION
+Extract and document every technical constraint imposed by the code skeleton that cannot be altered under any circumstances.
+
+### 2. IMPLEMENTATION BOUNDARY DEFINITION  
+Precisely delineate what code must be written versus what code must be preserved exactly as provided.
+
+### 3. DATA FLOW AND STATE MANAGEMENT DESIGN
+Design the complete data transformation pipeline from input to output, including all intermediate states and transformations.
+
+### 4. ERROR HANDLING AND VALIDATION ARCHITECTURE
+Define comprehensive error detection, handling, and recovery mechanisms for all possible failure modes.
+
+### 5. QUALITY ATTRIBUTE SATISFACTION PLAN
+Specify how each quality requirement will be technically achieved in the implementation.
+
+## REQUIRED OUTPUT SECTIONS
+
+### ARCHITECTURAL CONSTRAINTS ANALYSIS:
+
+**Preserved Function Signatures:**
+List every function signature from the code skeleton that must be maintained exactly, including:
+- Function name
+- Parameter names and types
+- Return type
+- Any decorators or annotations
+
+**Preserved Class Structures:**
+Document every class definition that must be maintained, including:
+- Class name and inheritance hierarchy
+- Method signatures within the class
+- Class-level variables and properties
+- Any metaclass or special method definitions
+
+**Fixed Import Dependencies:**
+List every import statement that must remain unchanged, including:
+- Module imports
+- Specific function/class imports
+- Import aliases if present
+
+**Immutable Architectural Patterns:**
+Identify all patterns in the existing code that must be replicated, including:
+- Data access patterns
+- Error handling approaches
+- Code organization conventions
+- Naming conventions and style
+
+### SOLUTION ARCHITECTURE DESIGN:
+
+**Core Implementation Strategy:**
+Describe the complete technical approach for fulfilling each functional requirement within the identified constraints.
+
+**Algorithm Selection Rationale:**
+For each algorithmic requirement, specify:
+- The exact algorithm to implement
+- Time and space complexity analysis
+- Justification for algorithm selection
+- Any optimizations required
+
+**Data Structure Specifications:**
+Define every data structure to be used, including:
+- Primary data containers and their types
+- Auxiliary data structures for intermediate processing
+- Memory allocation patterns
+- Data mutation policies
+
+**Component Responsibility Matrix:**
+Assign each functional requirement to specific components/functions, specifying:
+- Which component handles which requirement
+- Input/output contracts for each component
+- Dependencies between components
+- Interface specifications
+
+### INTEGRATION ARCHITECTURE:
+
+**Complete Data Flow Specification:**
+Map the entire data transformation pipeline from initial input to final output, detailing:
+- Each processing step
+- Data format at each stage
+- Transformation logic between stages
+- Error propagation paths
+
+**State Management Design:**
+Define how application state will be managed, including:
+- Variable scoping strategy
+- State mutation control
+- Shared state access patterns
+- State persistence requirements
+
+**Component Interaction Protocol:**
+Specify how different components will communicate, including:
+- Function call sequences
+- Data passing mechanisms
+- Error handling coordination
+- Resource sharing protocols
+
+### QUALITY ATTRIBUTES IMPLEMENTATION:
+
+**Performance Assurance Measures:**
+Detail specific techniques to meet performance requirements:
+- Algorithmic complexity guarantees
+- Memory usage optimization strategies
+- Processing efficiency improvements
+- Bottleneck prevention mechanisms
+
+**Maintainability Enforcement:**
+Specify practices to ensure code maintainability:
+- Code organization structure
+- Documentation standards
+- Modularity boundaries
+- Extension point definitions
+
+**Testability Infrastructure:**
+Design the testing support architecture:
+- Unit test isolation boundaries
+- Mocking interfaces
+- Test data generation strategies
+- Validation checkpoints
+
+**Robustness Implementation:**
+Define fault tolerance mechanisms:
+- Input validation layers
+- Exception handling hierarchy
+- Recovery procedures
+- Graceful degradation paths
+
+### RISK ANALYSIS AND MITIGATION:
+
+**Technical Risk Assessment:**
+Identify every potential technical challenge, including:
+- Algorithmic complexity risks
+- Integration compatibility issues
+- Performance boundary conditions
+- Edge case handling difficulties
+
+**Implementation Risk Mitigation:**
+Specify concrete mitigation strategies for each identified risk:
+- Alternative implementation approaches
+- Fallback mechanisms
+- Validation checkpoints
+- Rollback procedures
+
+**Complexity Management:**
+Define approaches to manage implementation complexity:
+- Problem decomposition strategy
+- Incremental implementation phases
+- Integration testing approach
+- Debugging support infrastructure
+
+### IMPLEMENTATION ROADMAP:
+
+**Phase 1: Foundation Implementation**
+List every foundational component that must be implemented first, in dependency order.
+
+**Phase 2: Core Functionality Implementation**  
+List every core feature component to implement after foundations are stable.
+
+**Phase 3: Edge Case and Error Handling**
+List all edge case handling and error management components.
+
+**Phase 4: Optimization and Validation**
+List all performance optimization and final validation tasks.
+
+## SPECIFIC TECHNICAL REQUIREMENTS
+
+### FOR CREATE TASKS:
+- All implementations must fit precisely within the provided skeleton structure
+- No existing function signatures may be modified
+- No additional parameters may be added to existing functions
+- All stubs and TODOs must be implemented according to their implied contracts
+- Any helper functions must follow the established code patterns
+
+### FOR FIX TASKS:
+- All fixes must be minimal and surgical
+- No working functionality may be disrupted
+- All existing interfaces must be preserved
+- Only specifically identified issues may be addressed
+- Regression prevention must be designed into every change
+
+## VALIDATION CRITERIA
+
+The architecture must be validated against these criteria:
+1. Every functional requirement has a clear implementation path
+2. All code skeleton constraints are strictly respected
+3. Data flow is complete and well-defined
+4. Error handling covers all identified failure modes
+5. Performance requirements are technically achievable
+6. Implementation risks are identified and mitigated
+
+## OUTPUT INSTRUCTIONS
+
+Generate the architecture analysis using exactly the section headers and structure specified above. Each section must contain complete technical details without omission. Do not include any examples, analogies, or placeholder text. Provide specific, actionable technical specifications that can be directly implemented by a development team.
+
+Begin the analysis now.
+""")
+FORMAT_PROMPT_V0=textwrap.dedent("""
+**📝 Response Format Requirements**
+
+1. **Strict Triplet Format**:
+   - `next_thought`: Detailed reasoning (include:
+     - Problem understanding
+     - Code analysis
+     - Solution justification
+     - Validation plan)
+   - `next_tool_name`: Must be an exact tool name from the tool list
+   - `next_tool_args`: Valid JSON with:
+     - Proper escaping
+     - No trailing commas
+     - Tool-specific parameters
+
+2. **Error Handling Format**:
+   - For errors: 
+     next_thought: "Error: [detailed explanation]"
+     next_tool_name: ""
+     next_tool_args: {}
+
+3. **Example Valid Format**:
+   next_thought: "I'll fix the JSON parsing issue by adding proper error handling and validation"
+   next_tool_name: "apply_code_edit"
+   next_tool_args: {
+     "file_path": "network.py",
+     "search": "return json.loads(response)",
+     "replace": "try:\n    return json.loads(response)\nexcept JSONDecodeError:\n    logger.error(f'Invalid JSON: {{response}}')\n    raise"
+   }
+
+4. **Invalid Format Examples** (Avoid These):
+   - Missing any of the three required fields
+   - JSON syntax errors in next_tool_args
+   - Extra text outside the triplet format
+   - Using incorrect tool names
+   - Not quoting special characters properly
+""")
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 for h in list(logger.handlers):
     logger.removeHandler(h)
@@ -348,6 +833,565 @@ stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 run_id=None
   
+class EnhancedCOT:
+    class Action:
+            
+        def __init__(self, next_thought: str, next_tool_name: str, next_tool_args: dict, observation: list|tuple|str,is_error:bool=False,raw_response:str=None,total_attempts:int=0,inference_error_counter:dict=None,request_data:list=None):
+            self.next_thought=next_thought
+            self.next_tool_name=next_tool_name
+            self.next_tool_args=next_tool_args
+            self.observation=";".join(observation) if isinstance(observation,list) else observation
+            self.is_error=is_error
+            self.raw_response=raw_response
+            self.total_attempts=total_attempts
+            self.inference_error_counter=inference_error_counter
+            self.request_data=request_data
+            self.is_deleted=False
+    def __init__(self,latest_observations_to_keep=5):
+        self.thoughts: list[EnhancedCOT.Action] = []
+        self.latest_observations_to_keep=latest_observations_to_keep
+        
+    def is_valid_tool_call(self, next_tool_name: str|list, next_tool_args: dict|list) -> bool:
+        if len(self.thoughts) == 0:
+            return True
+            
+        last_tool_name = self.thoughts[-1].next_tool_name
+        last_tool_args = self.thoughts[-1].next_tool_args
+        
+        # Exact match check - definitely reject
+        if next_tool_name == last_tool_name and next_tool_args == last_tool_args:
+            return False
+            
+        return True
+
+    def add_action(self, action: EnhancedCOT.Action) -> bool: # don't add if thought is repeated
+        # if not self.is_valid_tool_call(action.next_tool_name, action.next_tool_args):
+        #     return False
+        self.thoughts.append(action)
+        return True
+        
+    def is_thought_repeated(self)->bool:
+        # Check if the last thought is the same as the previous thought.
+        # If there are less than 2 thoughts, skip (return False).
+        if len(self.thoughts) < 2:
+            return False
+        last = self.thoughts[-1]
+        prev = self.thoughts[-2]
+        if last.next_tool_name == prev.next_tool_name and last.next_tool_args == prev.next_tool_args:
+            return True
+        return False
+    def to_str(self):
+        messages=[]
+        for i,thought in enumerate(self.thoughts):
+            if thought.is_deleted:
+                continue
+            if i<len(self.thoughts)-self.latest_observations_to_keep:
+                assistant_str = (
+                    f"next_thought:{thought.next_thought}\n"
+                    f"next_tool_name:{thought.next_tool_name}\n"
+                    f"next_tool_args:{thought.next_tool_args}\n"
+                )
+                # Compute observation summary length safely for str/list/None
+                if thought.observation is None:
+                    _obs_len = 0
+                elif isinstance(thought.observation, (list, tuple)):
+                    _obs_len = len(thought.observation)
+                else:
+                    _obs_len = len(str(thought.observation).splitlines())
+                user_str=( f"observation: {'error ocurred.' if thought.is_error else ''} "
+                    f"output omitted ({_obs_len}) lines\n")
+                
+            else:
+                if thought.is_error is None or i==len(self.thoughts)-1:
+                    assistant_str=f"next_thought:{thought.next_thought}\nnext_tool_name:{thought.next_tool_name}\nnext_tool_args:{thought.next_tool_args}"
+                    # Render list observations as JSON array for the model
+                    if isinstance(thought.observation, (list, tuple)):
+                        try:
+                            obs_render=json.dumps(list(thought.observation), ensure_ascii=False)
+                        except Exception:
+                            obs_render=str(thought.observation)
+                    else:
+                        obs_render=str(thought.observation)
+                    user_str=f"observation: {obs_render}"
+                else:
+                    if self.thoughts[-1].is_error==None and thought.is_error!=None:
+                        assistant_str = (
+                            f"next_thought:{thought.next_thought}\n"
+                            f"next_tool_name:{thought.next_tool_name}\n"
+                            f"next_tool_args:{thought.next_tool_args}")
+                        if thought.observation is None:
+                            _obs_len = 0
+                        elif isinstance(thought.observation, (list, tuple)):
+                            _obs_len = len(thought.observation)
+                        else:
+                            _obs_len = len(str(thought.observation).splitlines())
+                        user_str=(
+                            f"observation: error ocurred. detailed output omitted "
+                            f"({_obs_len}) lines\n"
+                        )
+                    else:
+                        assistant_str=f"next_thought:{thought.next_thought}\nnext_tool_name:{thought.next_tool_name}\nnext_tool_args:{thought.next_tool_args}"
+                        if isinstance(thought.observation, (list, tuple)):
+                            try:
+                                obs_render=json.dumps(list(thought.observation), ensure_ascii=False)
+                            except Exception:
+                                obs_render=str(thought.observation)
+                        else:
+                            obs_render=str(thought.observation)
+                        user_str=f"observation: {obs_render}"
+            messages.append({"role":"assistant","content":assistant_str})
+            messages.append({"role":"user","content":user_str})
+        return messages
+    
+    def export_to_csv(self,file_path:str="./xray.csv"):
+        with open(file_path, "w") as f:
+            writer=csv.writer(f)
+            writer.writerow(["next_thought","next_tool_name","next_tool_args","observation","is_error","raw_response","total_attempts","is_deleted"])
+            if len(self.thoughts)>0:
+                for thought in self.thoughts:
+                    writer.writerow([thought.next_thought,thought.next_tool_name,thought.next_tool_args,thought.observation,thought.is_error,thought.raw_response,thought.total_attempts,str(thought.inference_error_counter),str(thought.request_data),len(str(thought.request_data)),thought.is_deleted])
+                
+                
+    def get_tokens_used(self):
+        # quick, safe heuristic assuming ~0.75 tokens/word
+        msgs = self.to_str()
+        text = "\n".join(m["content"] for m in msgs)
+        word_count = len(text.split())
+        return int(word_count * 0.75)
+
+class Utils:
+    @classmethod
+    def get_available_modules(cls) -> set[str]:
+        """Return the set of top-level module names that can be imported in the
+        *current* Python environment.
+
+        The result includes:
+        • built-in/stdlib module names (`sys.builtin_module_names`)
+        • every top-level name discoverable on `sys.path` via `pkgutil.iter_modules()`
+        This is useful when we need to check whether a piece of code depends on a
+        package that is *not* present in the environment.
+        """
+        import sys, pkgutil
+
+        available: set[str] = set(sys.builtin_module_names)
+        for module_info in pkgutil.iter_modules():
+            # Only keep the top-level package name (before the first dot)
+            top_level = module_info.name.split(".")[0]
+            available.add(top_level)
+        return available
+
+    @classmethod
+    def message_to_str(cls,messages:list[dict]): 
+        final_str=""
+        for message in messages:
+            role=message["role"]
+            content=message["content"]
+            final_str+=f"{role}: {content}\n"
+        return final_str
+    
+    @classmethod
+    def limit_strings(cls,strings: str, n=1000)->str:
+        '''
+        Limit the number of strings to 1000
+        '''
+        strings_list=strings.split("\n")
+        if len(strings_list)>n:
+            return "\n".join(strings_list[:n])+"\n..." + f"({len(strings_list)-n} more lines)"
+        else:
+            return strings
+    @classmethod
+    def load_json(cls,json_string:str)->dict:
+        try:
+            return json.loads(json_string)
+        except Exception as e:
+            try:
+                return eval(json_string)
+            except Exception as e:
+                logger.info(f"unable to fix manually, trying with llm")
+                fixed_json=EnhancedNetwork.fix_json_string_with_llm(json_string)
+                # if fixed_json == ""
+                if fixed_json:
+                    return fixed_json
+                else:
+                    raise JSONDecodeError(f"Invalid JSON: {json_string}")
+    @classmethod
+    def log_to_failed_messages(cls,text_resp:str):
+        with open("../failed_messages.csv","a") as f:
+                writer=csv.writer(f)
+                writer.writerow([text_resp])
+
+class FunctionVisitor(ast.NodeVisitor):
+    def __init__(self, file_content: str):
+        self.functions = {}
+        self.current_class = None
+        self.class_hierarchy = []
+        self.file_content = file_content
+
+    def visit_ClassDef(self, node):
+        self.class_hierarchy.append(node.name)
+        self.current_class = "::".join(self.class_hierarchy)
+        self.generic_visit(node)
+        self.class_hierarchy.pop()
+        self.current_class = "::".join(self.class_hierarchy) if self.class_hierarchy else None
+
+    def _process_function(self, node):
+        full_function_name = f"{self.current_class}::{node.name}" if self.current_class else node.name
+        line_number = node.lineno
+        if isinstance(node.decorator_list, list) and len(node.decorator_list) > 0:
+            line_number = node.decorator_list[0].lineno
+        
+        end_line_number = line_number
+        if isinstance(node.body, list) and len(node.body) > 0:
+            end_line_number = node.body[-1].lineno
+        
+        lines = self.file_content.split("\n")
+        body = "\n".join(lines[line_number-1:end_line_number])
+        
+        self.functions[full_function_name] = {
+            "class": self.current_class,
+            "body": body,
+            "line_number": line_number
+        }
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        self._process_function(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self._process_function(node)
+
+    def visit_Module(self, node):
+        self.current_class = None
+        self.generic_visit(node)
+        self.current_class = None
+
+class ClassVisitor(ast.NodeVisitor):
+    def __init__(self, file_content: str):
+        self.classes = {}
+        self.file_content = file_content
+
+    def visit_ClassDef(self, node):
+        line_number = node.lineno
+        if isinstance(node.decorator_list, list) and len(node.decorator_list) > 0:
+            line_number = node.decorator_list[0].lineno
+        end_line_number = line_number
+        if isinstance(node.body, list) and len(node.body) > 0:
+            end_line_number = node.body[-1].lineno
+        lines = self.file_content.split("\n")
+        body = "\n".join(lines[line_number-1:end_line_number])
+        self.classes[node.name] = {
+            "body": body,
+            "line_number": line_number
+        }
+        self.generic_visit(node)
+
+class EnhancedNetwork:
+    class ErrorType(Enum):
+        EMPTY_RESPONSE=1
+        RESERVED_TOKEN_PRESENT=2
+        RATE_LIMIT_EXCEEDED=3
+        INVALID_RESPONSE_FORMAT=4
+        TIMEOUT=5
+        UNKNOWN=6
+        NETWORK_ERROR=7
+        AUTHENTICATION_ERROR=8
+        RESOURCE_EXHAUSTED=9
+    
+    @classmethod
+    def is_valid_response(cls,raw_text:str)->bool:
+        if type(raw_text) is dict and raw_text.get("error",None) is not None and raw_text.get("error")!="":
+            return False,cls.ErrorType.EMPTY_RESPONSE.name
+        if not raw_text.strip().endswith("}") and not raw_text.strip().endswith("}]"):
+            return False, "Incomplete response, your response must be shorter to fit within context limit"
+        if len(raw_text)==0:
+            return False, cls.ErrorType.EMPTY_RESPONSE.name
+        if "<|reserved_token_" in raw_text:
+            return False, cls.ErrorType.RESERVED_TOKEN_PRESENT.name
+        if 'API request failed with status 429' in raw_text:
+            return False, cls.ErrorType.RATE_LIMIT_EXCEEDED.name
+        if 'Read timed out' in raw_text:
+            return False, cls.ErrorType.TIMEOUT.name
+        if 'Network unreachable' in raw_text or 'Connection refused' in raw_text:
+            return False, cls.ErrorType.NETWORK_ERROR.name
+        return True, None
+
+    @classmethod
+    def get_error_counter(cls)->dict[str,int]:
+        return {
+            k:0 for k in cls.ErrorType.__members__
+        }   
+
+    @classmethod
+    def fix_json_string_with_llm(cls,json_string:str,attempt:int=0)->dict:
+        messages=[
+            {"role":"system", "content":"Fix the json string sent by the user.  Reply only with the json string and nothing else."},
+            {"role":"user", "content":json_string}
+        ]
+        response=cls.make_request(messages, model=DEEPSEEK_MODEL_NAME)
+        try:
+            response=response.replace('```json','').strip('```')
+            response=json.loads(response)
+            return response
+        except JSONDecodeError as e:
+            logger.error(f"Error fixing json string: {e},trying again..")
+            logger.error(f"json string is :{json_string}")
+            logger.error(f"LLM response is :{response}")
+            return None
+    
+    @classmethod
+    def make_request(cls,messages:list,model:str,attempt:int=0, temperature:float=0.0)->str:
+        global run_id
+        url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
+        print("[REQUEST] run_id:", run_id)
+
+        # Cache miss - make the actual request
+        request_data = {
+                "run_id": run_id if run_id else "1",
+                "messages": messages,
+                "temperature": temperature,
+            }
+
+        headers = {
+            "Content-Type": "application/json"
+        }
+        request_data['model'] = model
+        
+        try:
+            response = requests.post(url, json=request_data, timeout=120, headers=headers)
+            response.raise_for_status()
+        except requests.exceptions.Timeout:
+            logger.error(f"Request timeout after 120 seconds for model {model}")
+            return f"ERROR: Request timeout for model {model}"
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Connection error for model {model}: {e}")
+            return f"ERROR: Connection failed for model {model}"
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error for model {model}: {e}")
+            return f"ERROR: HTTP error {e.response.status_code} for model {model}"
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error for model {model}: {e}")
+            return f"ERROR: Request failed for model {model}"
+        
+        try:
+            response_json = response.json()
+        except JSONDecodeError as e:
+            logger.error(f"Invalid JSON response for model {model}: {e}")
+            logger.error(f"Response content: {response.text[:500]}...")
+            return f"ERROR: Invalid JSON response for model {model}"
+        
+        try:
+            is_oai_interface= type(response_json) is dict and response_json.get('choices') is not None and len(response_json.get('choices'))>0 and response_json.get('choices')[0].get('message') is not None
+            if is_oai_interface:
+                raw_text=response_json['choices'][0]['message']['content']
+            else:
+                if type(response_json) is str:
+                    raw_text=response_json.strip("\n").strip()
+                else:
+                    raw_text=response_json
+            if type(raw_text) is not dict:
+                raw_text=raw_text.lstrip()
+            return raw_text
+        except (KeyError, IndexError, TypeError) as e:
+            logger.error(f"Error parsing response structure for model {model}: {e}")
+            logger.error(f"Response JSON: {response_json}")
+            return f"ERROR: Invalid response structure for model {model}"
+        except Exception as e:
+            logger.error(f"Unexpected error processing response for model {model}: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return f"ERROR: Unexpected error for model {model}"
+
+    @classmethod
+    def _request_next_action_with_retry(cls, messages: dict, 
+                            model: str,
+                            max_retries: int = 5, 
+                            base_delay: float = 1.0,
+                            temperature: float = 0.0) -> str:
+        
+        raw_text='not defined'
+        error_counter=cls.get_error_counter()
+        next_thought, next_tool_name, next_tool_args = None, None, None
+        total_attempts=0
+        for attempt in range(max_retries):
+            try:
+                total_attempts+=1
+                index = AGENT_MODELS.index(model) if model in AGENT_MODELS else -1
+                raw_text=cls.make_request(messages,model=AGENT_MODELS[(index + attempt)%len(AGENT_MODELS)], temperature=temperature)
+                is_valid,error_msg=cls.is_valid_response(raw_text)
+                if not(is_valid):
+                    raise Exception(error_msg)
+                    
+                next_thought, next_tool_name, next_tool_args,error_msg = cls.parse_response(raw_text)
+                if error_msg:
+                    raise Exception(error_msg)
+                break
+            except Exception as e:
+                error_body = str(e)
+                logger.error(f"Error: {error_body}")
+                if attempt < max_retries:
+                    delay = base_delay
+                    logger.info(error_body)
+                    logger.error("--------------------------------")
+                    logger.error(f"response: {raw_text}")
+                    logger.error("--------------------------------")
+                    logger.info(f"[agent] Retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})") 
+                    if "RATE_LIMIT_EXCEEDED" in error_body:
+                        error_counter[cls.ErrorType.RATE_LIMIT_EXCEEDED.name]+=1
+                    elif "RESERVED_TOKEN_PRESENT" in error_body:
+                        error_counter[cls.ErrorType.RESERVED_TOKEN_PRESENT.name]+=1
+                    elif "EMPTY_RESPONSE" in error_body:
+                        error_counter[cls.ErrorType.EMPTY_RESPONSE.name]+=1
+                    elif "TIMEOUT" in error_body:
+                        error_counter[cls.ErrorType.TIMEOUT.name]+=1
+                    elif "Invalid JSON" in error_body:
+                        error_counter[cls.ErrorType.INVALID_RESPONSE_FORMAT.name]+=1
+                    elif "Invalid response" in error_body:
+                        error_counter[cls.ErrorType.INVALID_RESPONSE_FORMAT.name]+=1
+                    else:
+                        error_counter[cls.ErrorType.UNKNOWN.name]+=1
+                    if "RATE_LIMIT_EXCEEDED" not in error_body and "RESERVED_TOKEN_PRESENT" not in error_body and "EMPTY_RESPONSE" not in error_body and  "TIMEOUT" not in error_body:
+                        messages.append({"role":"assistant","content":raw_text})
+                        messages.append({"role":"user","content":"observation: "+error_body})
+                    time.sleep(random.uniform(1.2*delay, 1.5*delay))
+                    continue
+                else:
+                    error_counter[cls.ErrorType.TIMEOUT.name]+=1
+                    raise RuntimeError(error_body)
+        
+        return next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages
+    
+    
+    @classmethod
+    def parse_malformed_json(cls,arguments:list[str], json_string:str)->dict | str:    
+        # pattern of general json string with unescaped " in values keys from keys list
+        pattern = ''
+        for i, k in enumerate(arguments):
+            pattern += f'"{k}": (.*)'
+            if i != len(arguments) - 1:
+                pattern += r',\s*'
+
+        match=re.search(pattern, json_string)
+
+        if not match:
+            return f"Error: {json_string} can not match pattern {pattern}"
+        
+        result_json={}
+        for i in range(len(arguments)):
+            value=match.group(i+1)
+            value=value.strip()
+            if value.startswith('"') and value.endswith('"'):
+                value=value[1:-1]
+            #value=value.replace('"', '\\"')
+            value=value.replace('\\n','\n')
+            result_json[arguments[i]]=value
+        return result_json
+    
+    @classmethod
+    def parse_next_tool_args(cls,tool_name:str, next_tool_args: str)->dict | str:
+        '''
+        parse string to json, fix unecaped " in values like this: '{"a": "text "text2" text3 "text4"", "b": "text3"}'
+        returns json or error message
+        '''
+
+        next_tool_args=next_tool_args.replace('```json','').strip('```')
+        error_msg=''
+
+        try:
+            next_tool_args = Utils.load_json(next_tool_args.strip())
+        except JSONDecodeError as e:
+            error_msg=f"Invalid JSON: {next_tool_args}"    
+            try:
+                next_tool_args = cls.parse_malformed_json(EnhancedToolManager.get_tool_args_for_tool(tool_name,required=True), next_tool_args)
+            except EnhancedToolManager.Error as e:
+                raise Exception(e.message)
+            except Exception as e:
+                raise Exception(error_msg)
+        return next_tool_args
+
+    @classmethod
+    def inference(cls, messages: List[Dict[str, Any]], model: str, run_id: str = "1",return_json:bool=False, temperature:float=0.0) -> dict:
+        """Prod inference with caching"""
+        cleaned_msgs: List[Dict[str, Any]] = []
+        for m in messages:
+            role = m.get("role")
+            if role not in {"system", "user", "assistant", "tool"}:
+                continue
+            content = m.get("content", "")
+
+            if role == "assistant" and not content.strip():
+                continue
+
+            cleaned_msgs.append({"role": role, "content": content})
+
+        if not cleaned_msgs:
+            raise RuntimeError("No valid messages to send to proxy.")
+
+        next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages = cls._request_next_action_with_retry(cleaned_msgs, model=model, temperature=temperature)
+        
+        return next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages
+    
+    @classmethod
+    def sanitise_text_resp(cls,text_resp:str)->str:
+        # remove all leading and trailing quotes
+        text_resp=re.sub("[\'\"]*next_thought[\'\"]*:","next_thought:",text_resp)
+        text_resp=re.sub("[\'\"]*next_tool_name[\'\"]*:","next_tool_name:",text_resp)
+        text_resp=re.sub("[\'\"]*next_tool_args[\'\"]*:","next_tool_args:",text_resp)
+        text_resp=re.sub("[\'\"]*observation[\'\"]*:","observation:",text_resp)
+        if "next_thought" not in text_resp and "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:") and text_resp.find("next_tool_name:")>10:
+            logger.info(f"next_thought not found in {text_resp[:50]}, adding it")
+            text_resp="next_thought: "+text_resp
+        if "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:"):
+            # remove all leading and trailing quotes in tool_name
+            next_tool_name=text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n").strip("\'").strip("\"").strip()
+            text_resp=re.sub(f"next_tool_name:[\'\" ]*{next_tool_name}[\'\" ]*","next_tool_name: "+next_tool_name,text_resp)
+        
+        return text_resp
+
+    @classmethod
+    def parse_response(cls,text_resp: str)->tuple[str, Any, Any]:
+        error_msg=None
+        text_resp = text_resp.strip()
+        text_resp=text_resp.split("observation:")[0]
+        text_resp=text_resp.strip().strip("\n")
+        text_resp=cls.sanitise_text_resp(text_resp)
+        if "next_thought:" in text_resp and "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_thought:")<text_resp.find("next_tool_name:") and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:"):
+            next_thought=text_resp.split("next_thought:")[1].split("next_tool_name:")[0].strip().strip("\n")
+            next_tool_name_raw=text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n")
+            next_tool_args_raw=text_resp.split("next_tool_args:")[1].strip().split("next_thought:")[0].strip().strip("\n")
+            try:
+                # Enforce arrays per new contract: if single string/object, wrap as arrays
+                if next_tool_name_raw.startswith("["):
+                    next_tool_name = Utils.load_json(next_tool_name_raw)
+                else:
+                    next_tool_name = [next_tool_name_raw]
+                parsed_args = cls.parse_next_tool_args(next_tool_name, next_tool_args_raw)
+                if isinstance(parsed_args, list):
+                    next_tool_args = parsed_args
+                else:
+                    next_tool_args = [parsed_args for _ in next_tool_name]
+            except JSONDecodeError as e:
+                error_msg=f"Invalid JSON: {str(e)}"
+                Utils.log_to_failed_messages(text_resp)
+                
+        else:
+            if "next_thought:" not in text_resp:
+                error_msg="Invalid response. next_thought not found"
+            elif "next_tool_name:" not in text_resp:
+                error_msg="Invalid response. next_tool_name not found"
+            elif "next_tool_args:" not in text_resp:
+                error_msg="Invalid response. next_tool_args not found"
+            elif text_resp.find("next_thought:")>text_resp.find("next_tool_name:"):
+                error_msg="Invalid response. next_thought is after next_tool_name"
+            elif text_resp.find("next_tool_name:")>text_resp.find("next_tool_args:"):
+                error_msg="Invalid response. next_tool_name is after next_tool_args"
+            else:
+                logger.error(f"We have no clue why parsing failed. Please check this \n{text_resp}\n")
+            Utils.log_to_failed_messages(text_resp)
+            return None,None,None,error_msg
+
+        if len(next_tool_name) == 1:
+            return next_thought, next_tool_name[0], next_tool_args[0], error_msg
+            
+        return next_thought, next_tool_name, next_tool_args,error_msg
 
 class EnhancedToolManager:
     logs = []
@@ -1428,566 +2472,615 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         else: 
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.BUG_REPORT_REQUIRED.name,qa_response.get("analysis",""))
 
+# ---------------------------------------------------------------------------
+# Chunk representation and collector ---------------------------------------
+# ---------------------------------------------------------------------------
 
-class EnhancedCOT:
-    class Action:
-            
-        def __init__(self, next_thought: str, next_tool_name: str, next_tool_args: dict, observation: list|tuple|str,is_error:bool=False,raw_response:str=None,total_attempts:int=0,inference_error_counter:dict=None,request_data:list=None):
-            self.next_thought=next_thought
-            self.next_tool_name=next_tool_name
-            self.next_tool_args=next_tool_args
-            self.observation=";".join(observation) if isinstance(observation,list) else observation
-            self.is_error=is_error
-            self.raw_response=raw_response
-            self.total_attempts=total_attempts
-            self.inference_error_counter=inference_error_counter
-            self.request_data=request_data
-            self.is_deleted=False
-    def __init__(self,latest_observations_to_keep=5):
-        self.thoughts: list[EnhancedCOT.Action] = []
-        self.latest_observations_to_keep=latest_observations_to_keep
-        
-    def is_valid_tool_call(self, next_tool_name: str|list, next_tool_args: dict|list) -> bool:
-        if len(self.thoughts) == 0:
-            return True
-            
-        last_tool_name = self.thoughts[-1].next_tool_name
-        last_tool_args = self.thoughts[-1].next_tool_args
-        
-        # Exact match check - definitely reject
-        if next_tool_name == last_tool_name and next_tool_args == last_tool_args:
-            return False
-            
-        return True
+class Chunk(NamedTuple):
+    file: str
+    start_line: int
+    end_line: int
+    text: str
 
-    def add_action(self, action: EnhancedCOT.Action) -> bool: # don't add if thought is repeated
-        # if not self.is_valid_tool_call(action.next_tool_name, action.next_tool_args):
-        #     return False
-        self.thoughts.append(action)
-        return True
-        
-    def is_thought_repeated(self)->bool:
-        # Check if the last thought is the same as the previous thought.
-        # If there are less than 2 thoughts, skip (return False).
-        if len(self.thoughts) < 2:
-            return False
-        last = self.thoughts[-1]
-        prev = self.thoughts[-2]
-        if last.next_tool_name == prev.next_tool_name and last.next_tool_args == prev.next_tool_args:
-            return True
-        return False
-    def to_str(self):
-        messages=[]
-        for i,thought in enumerate(self.thoughts):
-            if thought.is_deleted:
+
+def _guess_tokens(text: str) -> int:
+    """Rough token count estimate: ~0.75 tokens per word."""
+    return int(len(text.split()) * 0.75)
+
+
+def _collect_code_chunks(root: str = ".") -> List[Chunk]:
+    """Collect function-level code chunks from Python files."""
+    chunks: List[Chunk] = []
+    
+    for root, _, files in os.walk(root):
+        # Skip hidden directories and common non-source dirs
+        if any(part.startswith('.') for part in Path(root).parts):
+            continue
+        if root.endswith(('__pycache__', 'node_modules', '.git')):
+            continue
+            
+        for file in files:
+            if not file.endswith('.py'):
                 continue
-            if i<len(self.thoughts)-self.latest_observations_to_keep:
-                assistant_str = (
-                    f"next_thought:{thought.next_thought}\n"
-                    f"next_tool_name:{thought.next_tool_name}\n"
-                    f"next_tool_args:{thought.next_tool_args}\n"
-                )
-                # Compute observation summary length safely for str/list/None
-                if thought.observation is None:
-                    _obs_len = 0
-                elif isinstance(thought.observation, (list, tuple)):
-                    _obs_len = len(thought.observation)
-                else:
-                    _obs_len = len(str(thought.observation).splitlines())
-                user_str=( f"observation: {'error ocurred.' if thought.is_error else ''} "
-                    f"output omitted ({_obs_len}) lines\n")
                 
-            else:
-                if thought.is_error is None or i==len(self.thoughts)-1:
-                    assistant_str=f"next_thought:{thought.next_thought}\nnext_tool_name:{thought.next_tool_name}\nnext_tool_args:{thought.next_tool_args}"
-                    # Render list observations as JSON array for the model
-                    if isinstance(thought.observation, (list, tuple)):
-                        try:
-                            obs_render=json.dumps(list(thought.observation), ensure_ascii=False)
-                        except Exception:
-                            obs_render=str(thought.observation)
-                    else:
-                        obs_render=str(thought.observation)
-                    user_str=f"observation: {obs_render}"
-                else:
-                    if self.thoughts[-1].is_error==None and thought.is_error!=None:
-                        assistant_str = (
-                            f"next_thought:{thought.next_thought}\n"
-                            f"next_tool_name:{thought.next_tool_name}\n"
-                            f"next_tool_args:{thought.next_tool_args}")
-                        if thought.observation is None:
-                            _obs_len = 0
-                        elif isinstance(thought.observation, (list, tuple)):
-                            _obs_len = len(thought.observation)
-                        else:
-                            _obs_len = len(str(thought.observation).splitlines())
-                        user_str=(
-                            f"observation: error ocurred. detailed output omitted "
-                            f"({_obs_len}) lines\n"
-                        )
-                    else:
-                        assistant_str=f"next_thought:{thought.next_thought}\nnext_tool_name:{thought.next_tool_name}\nnext_tool_args:{thought.next_tool_args}"
-                        if isinstance(thought.observation, (list, tuple)):
-                            try:
-                                obs_render=json.dumps(list(thought.observation), ensure_ascii=False)
-                            except Exception:
-                                obs_render=str(thought.observation)
-                        else:
-                            obs_render=str(thought.observation)
-                        user_str=f"observation: {obs_render}"
-            messages.append({"role":"assistant","content":assistant_str})
-            messages.append({"role":"user","content":user_str})
-        return messages
-    
-    def export_to_csv(self,file_path:str="./xray.csv"):
-        with open(file_path, "w") as f:
-            writer=csv.writer(f)
-            writer.writerow(["next_thought","next_tool_name","next_tool_args","observation","is_error","raw_response","total_attempts","is_deleted"])
-            if len(self.thoughts)>0:
-                for thought in self.thoughts:
-                    writer.writerow([thought.next_thought,thought.next_tool_name,thought.next_tool_args,thought.observation,thought.is_error,thought.raw_response,thought.total_attempts,str(thought.inference_error_counter),str(thought.request_data),len(str(thought.request_data)),thought.is_deleted])
-                
-                
-    def get_tokens_used(self):
-        # quick, safe heuristic assuming ~0.75 tokens/word
-        msgs = self.to_str()
-        text = "\n".join(m["content"] for m in msgs)
-        word_count = len(text.split())
-        return int(word_count * 0.75)
-
-class Utils:
-    @classmethod
-    def get_available_modules(cls) -> set[str]:
-        """Return the set of top-level module names that can be imported in the
-        *current* Python environment.
-
-        The result includes:
-        • built-in/stdlib module names (`sys.builtin_module_names`)
-        • every top-level name discoverable on `sys.path` via `pkgutil.iter_modules()`
-        This is useful when we need to check whether a piece of code depends on a
-        package that is *not* present in the environment.
-        """
-        import sys, pkgutil
-
-        available: set[str] = set(sys.builtin_module_names)
-        for module_info in pkgutil.iter_modules():
-            # Only keep the top-level package name (before the first dot)
-            top_level = module_info.name.split(".")[0]
-            available.add(top_level)
-        return available
-
-    @classmethod
-    def message_to_str(cls,messages:list[dict]): 
-        final_str=""
-        for message in messages:
-            role=message["role"]
-            content=message["content"]
-            final_str+=f"{role}: {content}\n"
-        return final_str
-    
-    @classmethod
-    def limit_strings(cls,strings: str, n=1000)->str:
-        '''
-        Limit the number of strings to 1000
-        '''
-        strings_list=strings.split("\n")
-        if len(strings_list)>n:
-            return "\n".join(strings_list[:n])+"\n..." + f"({len(strings_list)-n} more lines)"
-        else:
-            return strings
-    @classmethod
-    def load_json(cls,json_string:str)->dict:
-        try:
-            return json.loads(json_string)
-        except Exception as e:
+            file_path = os.path.join(root, file)
             try:
-                return eval(json_string)
-            except Exception as e:
-                logger.info(f"unable to fix manually, trying with llm")
-                fixed_json=EnhancedNetwork.fix_json_string_with_llm(json_string)
-                # if fixed_json == ""
-                if fixed_json:
-                    return fixed_json
-                else:
-                    raise JSONDecodeError(f"Invalid JSON: {json_string}")
-    @classmethod
-    def log_to_failed_messages(cls,text_resp:str):
-        with open("../failed_messages.csv","a") as f:
-                writer=csv.writer(f)
-                writer.writerow([text_resp])
-
-class FunctionVisitor(ast.NodeVisitor):
-    def __init__(self, file_content: str):
-        self.functions = {}
-        self.current_class = None
-        self.class_hierarchy = []
-        self.file_content = file_content
-
-    def visit_ClassDef(self, node):
-        self.class_hierarchy.append(node.name)
-        self.current_class = "::".join(self.class_hierarchy)
-        self.generic_visit(node)
-        self.class_hierarchy.pop()
-        self.current_class = "::".join(self.class_hierarchy) if self.class_hierarchy else None
-
-    def _process_function(self, node):
-        full_function_name = f"{self.current_class}::{node.name}" if self.current_class else node.name
-        line_number = node.lineno
-        if isinstance(node.decorator_list, list) and len(node.decorator_list) > 0:
-            line_number = node.decorator_list[0].lineno
-        
-        end_line_number = line_number
-        if isinstance(node.body, list) and len(node.body) > 0:
-            end_line_number = node.body[-1].lineno
-        
-        lines = self.file_content.split("\n")
-        body = "\n".join(lines[line_number-1:end_line_number])
-        
-        self.functions[full_function_name] = {
-            "class": self.current_class,
-            "body": body,
-            "line_number": line_number
-        }
-        self.generic_visit(node)
-
-    def visit_FunctionDef(self, node):
-        self._process_function(node)
-
-    def visit_AsyncFunctionDef(self, node):
-        self._process_function(node)
-
-    def visit_Module(self, node):
-        self.current_class = None
-        self.generic_visit(node)
-        self.current_class = None
-
-class ClassVisitor(ast.NodeVisitor):
-    def __init__(self, file_content: str):
-        self.classes = {}
-        self.file_content = file_content
-
-    def visit_ClassDef(self, node):
-        line_number = node.lineno
-        if isinstance(node.decorator_list, list) and len(node.decorator_list) > 0:
-            line_number = node.decorator_list[0].lineno
-        end_line_number = line_number
-        if isinstance(node.body, list) and len(node.body) > 0:
-            end_line_number = node.body[-1].lineno
-        lines = self.file_content.split("\n")
-        body = "\n".join(lines[line_number-1:end_line_number])
-        self.classes[node.name] = {
-            "body": body,
-            "line_number": line_number
-        }
-        self.generic_visit(node)
-
-class EnhancedNetwork:
-    class ErrorType(Enum):
-        EMPTY_RESPONSE=1
-        RESERVED_TOKEN_PRESENT=2
-        RATE_LIMIT_EXCEEDED=3
-        INVALID_RESPONSE_FORMAT=4
-        TIMEOUT=5
-        UNKNOWN=6
-        NETWORK_ERROR=7
-        AUTHENTICATION_ERROR=8
-        RESOURCE_EXHAUSTED=9
-    
-    @classmethod
-    def is_valid_response(cls,raw_text:str)->bool:
-        if type(raw_text) is dict and raw_text.get("error",None) is not None and raw_text.get("error")!="":
-            return False,cls.ErrorType.EMPTY_RESPONSE.name
-        if not raw_text.strip().endswith("}") and not raw_text.strip().endswith("}]"):
-            return False, "Incomplete response, your response must be shorter to fit within context limit"
-        if len(raw_text)==0:
-            return False, cls.ErrorType.EMPTY_RESPONSE.name
-        if "<|reserved_token_" in raw_text:
-            return False, cls.ErrorType.RESERVED_TOKEN_PRESENT.name
-        if 'API request failed with status 429' in raw_text:
-            return False, cls.ErrorType.RATE_LIMIT_EXCEEDED.name
-        if 'Read timed out' in raw_text:
-            return False, cls.ErrorType.TIMEOUT.name
-        if 'Network unreachable' in raw_text or 'Connection refused' in raw_text:
-            return False, cls.ErrorType.NETWORK_ERROR.name
-        return True, None
-
-    @classmethod
-    def get_error_counter(cls)->dict[str,int]:
-        return {
-            k:0 for k in cls.ErrorType.__members__
-        }   
-
-    @classmethod
-    def fix_json_string_with_llm(cls,json_string:str,attempt:int=0)->dict:
-        messages=[
-            {"role":"system", "content":"Fix the json string sent by the user.  Reply only with the json string and nothing else."},
-            {"role":"user", "content":json_string}
-        ]
-        response=cls.make_request(messages, model=DEEPSEEK_MODEL_NAME)
-        try:
-            response=response.replace('```json','').strip('```')
-            response=json.loads(response)
-            return response
-        except JSONDecodeError as e:
-            logger.error(f"Error fixing json string: {e},trying again..")
-            logger.error(f"json string is :{json_string}")
-            logger.error(f"LLM response is :{response}")
-            return None
-    
-    @classmethod
-    def make_request(cls,messages:list,model:str,attempt:int=0, temperature:float=0.0)->str:
-        global run_id
-        url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
-        print("[REQUEST] run_id:", run_id)
-
-        # Cache miss - make the actual request
-        request_data = {
-                "run_id": run_id if run_id else str(uuid4()),
-                "messages": messages,
-                "temperature": temperature,
-            }
-
-        headers = {
-            "Content-Type": "application/json"
-        }
-        request_data['model'] = model
-        
-        try:
-            response = requests.post(url, json=request_data, timeout=120, headers=headers)
-            response.raise_for_status()
-        except requests.exceptions.Timeout:
-            logger.error(f"Request timeout after 120 seconds for model {model}")
-            return f"ERROR: Request timeout for model {model}"
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"Connection error for model {model}: {e}")
-            return f"ERROR: Connection failed for model {model}"
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error for model {model}: {e}")
-            return f"ERROR: HTTP error {e.response.status_code} for model {model}"
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error for model {model}: {e}")
-            return f"ERROR: Request failed for model {model}"
-        
-        try:
-            response_json = response.json()
-        except JSONDecodeError as e:
-            logger.error(f"Invalid JSON response for model {model}: {e}")
-            logger.error(f"Response content: {response.text[:500]}...")
-            return f"ERROR: Invalid JSON response for model {model}"
-        
-        try:
-            is_oai_interface= type(response_json) is dict and response_json.get('choices') is not None and len(response_json.get('choices'))>0 and response_json.get('choices')[0].get('message') is not None
-            if is_oai_interface:
-                raw_text=response_json['choices'][0]['message']['content']
-            else:
-                if type(response_json) is str:
-                    raw_text=response_json.strip("\n").strip()
-                else:
-                    raw_text=response_json
-            if type(raw_text) is not dict:
-                raw_text=raw_text.lstrip()
-            return raw_text
-        except (KeyError, IndexError, TypeError) as e:
-            logger.error(f"Error parsing response structure for model {model}: {e}")
-            logger.error(f"Response JSON: {response_json}")
-            return f"ERROR: Invalid response structure for model {model}"
-        except Exception as e:
-            logger.error(f"Unexpected error processing response for model {model}: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return f"ERROR: Unexpected error for model {model}"
-
-    @classmethod
-    def _request_next_action_with_retry(cls, messages: dict, 
-                            model: str,
-                            max_retries: int = 5, 
-                            base_delay: float = 1.0,
-                            temperature: float = 0.0) -> str:
-        
-        raw_text='not defined'
-        error_counter=cls.get_error_counter()
-        next_thought, next_tool_name, next_tool_args = None, None, None
-        total_attempts=0
-        for attempt in range(max_retries):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            except (UnicodeDecodeError, PermissionError):
+                continue
+                
             try:
-                total_attempts+=1
-                index = AGENT_MODELS.index(model) if model in AGENT_MODELS else -1
-                raw_text=cls.make_request(messages,model=AGENT_MODELS[(index + attempt)%len(AGENT_MODELS)], temperature=temperature)
-                is_valid,error_msg=cls.is_valid_response(raw_text)
-                if not(is_valid):
-                    raise Exception(error_msg)
+                tree = ast.parse(content, filename=file_path)
+            except SyntaxError:
+                continue
+                
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    start_line = getattr(node, 'lineno', 1)
+                    end_line = getattr(node, 'end_lineno', start_line)
                     
-                next_thought, next_tool_name, next_tool_args,error_msg = cls.parse_response(raw_text)
-                if error_msg:
-                    raise Exception(error_msg)
-                break
-            except Exception as e:
-                error_body = str(e)
-                logger.error(f"Error: {error_body}")
-                if attempt < max_retries:
-                    delay = base_delay
-                    logger.info(error_body)
-                    logger.error("--------------------------------")
-                    logger.error(f"response: {raw_text}")
-                    logger.error("--------------------------------")
-                    logger.info(f"[agent] Retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})") 
-                    if "RATE_LIMIT_EXCEEDED" in error_body:
-                        error_counter[cls.ErrorType.RATE_LIMIT_EXCEEDED.name]+=1
-                    elif "RESERVED_TOKEN_PRESENT" in error_body:
-                        error_counter[cls.ErrorType.RESERVED_TOKEN_PRESENT.name]+=1
-                    elif "EMPTY_RESPONSE" in error_body:
-                        error_counter[cls.ErrorType.EMPTY_RESPONSE.name]+=1
-                    elif "TIMEOUT" in error_body:
-                        error_counter[cls.ErrorType.TIMEOUT.name]+=1
-                    elif "Invalid JSON" in error_body:
-                        error_counter[cls.ErrorType.INVALID_RESPONSE_FORMAT.name]+=1
-                    elif "Invalid response" in error_body:
-                        error_counter[cls.ErrorType.INVALID_RESPONSE_FORMAT.name]+=1
-                    else:
-                        error_counter[cls.ErrorType.UNKNOWN.name]+=1
-                    if "RATE_LIMIT_EXCEEDED" not in error_body and "RESERVED_TOKEN_PRESENT" not in error_body and "EMPTY_RESPONSE" not in error_body and  "TIMEOUT" not in error_body:
-                        messages.append({"role":"assistant","content":raw_text})
-                        messages.append({"role":"user","content":"observation: "+error_body})
-                    time.sleep(random.uniform(1.2*delay, 1.5*delay))
+                    if end_line is None:
+                        # Fallback: count lines in the node
+                        lines = content.split('\n')
+                        if start_line <= len(lines):
+                            node_text = '\n'.join(lines[start_line-1:])
+                            end_line = start_line + node_text.count('\n')
+                        else:
+                            end_line = start_line
+                    
+                    # Extract the actual source lines
+                    lines = content.split('\n')
+                    if start_line <= len(lines) and end_line <= len(lines):
+                        chunk_text = '\n'.join(lines[start_line-1:end_line])
+                        
+                        # Skip if chunk is too large
+                        if len(chunk_text) > MAX_EMBED_CHARS:
+                            continue
+                            
+                        chunks.append(Chunk(
+                            file=file_path,
+                            start_line=start_line,
+                            end_line=end_line,
+                            text=chunk_text
+                        ))
+                        
+            # Also add the entire file as a chunk if it's reasonably sized
+            if len(content) <= MAX_EMBED_CHARS and content.strip():
+                chunks.append(Chunk(
+                    file=file_path,
+                    start_line=1,
+                    end_line=content.count('\n') + 1,
+                    text=content
+                ))
+    
+    return chunks
+
+
+def _token_windows(text: str, max_tokens: int = MAX_EMBED_TOKENS) -> List[str]:
+    """Split text into token-limited windows."""
+    words = text.split()
+    windows = []
+    
+    for i in range(0, len(words), max_tokens):
+        window_words = words[i:i + max_tokens]
+        windows.append(' '.join(window_words))
+    
+    return windows
+
+
+def _lang_tag(path: str) -> str:
+    """Return language tag for syntax highlighting."""
+    ext = os.path.splitext(path)[1].lower()
+    lang_map = {
+        '.py': 'python',
+        '.js': 'javascript',
+        '.ts': 'typescript',
+        '.java': 'java',
+        '.cpp': 'cpp',
+        '.c': 'c',
+        '.h': 'c',
+        '.hpp': 'cpp',
+        '.cs': 'csharp',
+        '.go': 'go',
+        '.rs': 'rust',
+        '.php': 'php',
+        '.rb': 'ruby',
+        '.swift': 'swift',
+        '.kt': 'kotlin',
+        '.scala': 'scala',
+        '.r': 'r',
+        '.m': 'matlab',
+        '.sh': 'bash',
+        '.sql': 'sql',
+        '.html': 'html',
+        '.css': 'css',
+        '.xml': 'xml',
+        '.yaml': 'yaml',
+        '.yml': 'yaml',
+        '.json': 'json',
+        '.md': 'markdown',
+        '.txt': 'text',
+    }
+    return lang_map.get(ext, 'text')
+
+
+def _collect_repo_texts(root: str = ".") -> Dict[str, str]:
+    """Collect all text content from repository files."""
+    texts: Dict[str, str] = {}
+    
+    for root, _, files in os.walk(root):
+        # Skip hidden directories and common non-source dirs
+        if any(part.startswith('.') for part in Path(root).parts):
+            continue
+        if root.endswith(('__pycache__', 'node_modules', '.git')):
+            continue
+            
+        for file in files:
+            file_path = os.path.join(root, file)
+            
+            # Skip binary files and very large files
+            if file.endswith(('.png', '.jpg', '.jpeg', '.gif', '.ico', '.pdf', '.zip', '.tar', '.gz')):
+                continue
+                
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    
+                # Skip if file is too large
+                if len(content) > MAX_EMBED_CHARS:
                     continue
-                else:
-                    error_counter[cls.ErrorType.TIMEOUT.name]+=1
-                    raise RuntimeError(error_body)
-        
-        return next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages
-    
-    
-    @classmethod
-    def parse_malformed_json(cls,arguments:list[str], json_string:str)->dict | str:    
-        # pattern of general json string with unescaped " in values keys from keys list
-        pattern = ''
-        for i, k in enumerate(arguments):
-            pattern += f'"{k}": (.*)'
-            if i != len(arguments) - 1:
-                pattern += r',\s*'
+                    
+                texts[file_path] = content
+                
+            except (UnicodeDecodeError, PermissionError):
+                continue
 
-        match=re.search(pattern, json_string)
+    return texts
 
-        if not match:
-            return f"Error: {json_string} can not match pattern {pattern}"
-        
-        result_json={}
-        for i in range(len(arguments)):
-            value=match.group(i+1)
-            value=value.strip()
-            if value.startswith('"') and value.endswith('"'):
-                value=value[1:-1]
-            #value=value.replace('"', '\\"')
-            value=value.replace('\\n','\n')
-            result_json[arguments[i]]=value
-        return result_json
-    
-    @classmethod
-    def parse_next_tool_args(cls,tool_name:str, next_tool_args: str)->dict | str:
-        '''
-        parse string to json, fix unecaped " in values like this: '{"a": "text "text2" text3 "text4"", "b": "text3"}'
-        returns json or error message
-        '''
 
-        next_tool_args=next_tool_args.replace('```json','').strip('```')
-        error_msg=''
+# ---------------------------------------------------------------------------
+# Embedding cache and helper -------------------------------------------------
+# ---------------------------------------------------------------------------
+
+_EMBED_CACHE: Dict[str, List[float]] = {}
+ZERO_VEC: List[float] = [0.0] * 1024  # embedding for empty input
+
+
+def _remote_embed(text: str, proxy_url: str, run_id: str) -> List[float]:
+    """Return embedding vector for *text* via the proxy /api/embedding endpoint.
+
+    Caches results in-memory to avoid duplicate HTTP calls.
+    """
+    print(f"[Agent] Embedding request: {len(text)} chars")
+    # Short-circuit empty or whitespace-only inputs.
+    if not text.strip():
+        return _EMBED_CACHE.setdefault("", [0.0] * 1024)
+
+    # Retry–shrink loop to satisfy 512-token limit
+    attempt_text = text
+    for _ in range(2):  # original + 1 retry after halving
+        tokens = attempt_text.split()
+        if len(tokens) > MAX_EMBED_TOKENS:
+            attempt_text = " ".join(tokens[:MAX_EMBED_TOKENS])
+
+        url = f"{proxy_url.rstrip('/')}/api/embedding"
+        req = _urlreq.Request(
+            url,
+            data=json.dumps({"input": attempt_text, "run_id": run_id}, ensure_ascii=False).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
 
         try:
-            next_tool_args = Utils.load_json(next_tool_args.strip())
-        except JSONDecodeError as e:
-            error_msg=f"Invalid JSON: {next_tool_args}"    
-            try:
-                next_tool_args = cls.parse_malformed_json(EnhancedToolManager.get_tool_args_for_tool(tool_name,required=True), next_tool_args)
-            except EnhancedToolManager.Error as e:
-                raise Exception(e.message)
-            except Exception as e:
-                raise Exception(error_msg)
-        return next_tool_args
+            with _urlreq.urlopen(req, timeout=60) as resp:  # Reduced timeout from 300 to 60
+                data_raw = resp.read()
+                data = json.loads(data_raw.decode())
+                print(f"[Agent] Embedding response: {len(data)} bytes")
 
-    @classmethod
-    def inference(cls, messages: List[Dict[str, Any]], model: str, run_id: str = str(uuid4()),return_json:bool=False, temperature:float=0.0) -> dict:
-        """Prod inference with caching"""
-        cleaned_msgs: List[Dict[str, Any]] = []
-        for m in messages:
-            role = m.get("role")
-            if role not in {"system", "user", "assistant", "tool"}:
-                continue
-            content = m.get("content", "")
+                if isinstance(data, list):
+                    vec = data[0] if (len(data) == 1 and isinstance(data[0], list)) else data
+                    _EMBED_CACHE[text] = vec
+                    return vec
+                if isinstance(data, dict) and "embedding" in data:
+                    vec = data["embedding"]
+                    _EMBED_CACHE[text] = vec
+                    return vec
 
-            if role == "assistant" and not content.strip():
-                continue
+                # If we received a validation error about tokens, halve and retry
+                if isinstance(data, dict) and data.get("error_type") == "Validation":
+                    attempt_text = " ".join(tokens[: len(tokens) // 2])
+                    continue
 
-            cleaned_msgs.append({"role": role, "content": content})
+                return ZERO_VEC
+        except Exception as e:
+            print(f"[Agent] Embedding error: {e}")
+            return ZERO_VEC
 
-        if not cleaned_msgs:
-            raise RuntimeError("No valid messages to send to proxy.")
+    return ZERO_VEC
 
-        next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages = cls._request_next_action_with_retry(cleaned_msgs, model=model, temperature=temperature)
+
+def _cosine(u: List[float], v: List[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    nu = math.sqrt(sum(x * x for x in u))
+    nv = math.sqrt(sum(x * x for x in v))
+
+    if nu == 0 or nv == 0:
+        return 0.0
+
+    return sum(x * y for x, y in zip(u, v)) / (nu * nv)
+
+
+# ---------------------------------------------------------------------------
+# One-shot retrieval using remote embeddings --------------------------------
+# ---------------------------------------------------------------------------
+
+def run_oneshot(
+    problem_text: str,
+    *,
+    proxy_url: str,
+    model_name: str,
+    run_id: str,
+    top_k: int = 30,
+) -> str:
+    """Build repository summary and send a single LLM call.
+
+    Embeddings are fetched from the internal `/api/embedding` proxy endpoint, so no model weights or internet access are required inside the sandbox.
+    """
+    print(f"[Agent] One-shot mode: {len(problem_text)} chars problem")
+    if USE_FUNCTION_CHUNKS:
+        code_chunks = _collect_code_chunks()
+        if not code_chunks:
+            raise RuntimeError("repository appears empty – nothing to embed")
+        chunk_texts = [c.text for c in code_chunks]
+    else:
+        repo_texts = _collect_repo_texts()
+        if not repo_texts:
+            raise RuntimeError("repository appears empty – nothing to embed")
+        code_chunks = [Chunk(file=fp, start_line=1, end_line=text.count("\n") + 1, text=text) for fp, text in repo_texts.items()]
+        chunk_texts = [c.text for c in code_chunks]
+
+    # --------------------------------------------------------------------
+    # Cheap TF-IDF pre-filter to limit expensive embedding calls ----------
+    # --------------------------------------------------------------------
+
+    PRE_FILTER_TOP = int(os.getenv("PREFILTER_TOP", "50"))  # Reduced from 200 for faster processing
+
+    if len(chunk_texts) > PRE_FILTER_TOP:
+        # Simple TF-IDF scoring
+        problem_words = set(problem_text.lower().split())
+        chunk_scores = []
         
-        return next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages
-    
-    @classmethod
-    def sanitise_text_resp(cls,text_resp:str)->str:
-        # remove all leading and trailing quotes
-        text_resp=re.sub("[\'\"]*next_thought[\'\"]*:","next_thought:",text_resp)
-        text_resp=re.sub("[\'\"]*next_tool_name[\'\"]*:","next_tool_name:",text_resp)
-        text_resp=re.sub("[\'\"]*next_tool_args[\'\"]*:","next_tool_args:",text_resp)
-        text_resp=re.sub("[\'\"]*observation[\'\"]*:","observation:",text_resp)
-        if "next_thought" not in text_resp and "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:") and text_resp.find("next_tool_name:")>10:
-            logger.info(f"next_thought not found in {text_resp[:50]}, adding it")
-            text_resp="next_thought: "+text_resp
-        if "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:"):
-            # remove all leading and trailing quotes in tool_name
-            next_tool_name=text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n").strip("\'").strip("\"").strip()
-            text_resp=re.sub(f"next_tool_name:[\'\" ]*{next_tool_name}[\'\" ]*","next_tool_name: "+next_tool_name,text_resp)
+        for chunk_text in chunk_texts:
+            chunk_words = set(chunk_text.lower().split())
+            common_words = problem_words.intersection(chunk_words)
+            score = len(common_words) / max(len(problem_words), 1)
+            chunk_scores.append(score)
         
-        return text_resp
+        # Keep top chunks by TF-IDF score
+        sorted_indices = sorted(range(len(chunk_scores)), key=lambda i: -chunk_scores[i])
+        top_indices = sorted_indices[:PRE_FILTER_TOP]
+        
+        code_chunks = [code_chunks[i] for i in top_indices]
+        chunk_texts = [chunk_texts[i] for i in top_indices]
 
-    @classmethod
-    def parse_response(cls,text_resp: str)->tuple[str, Any, Any]:
-        error_msg=None
-        text_resp = text_resp.strip()
-        text_resp=text_resp.split("observation:")[0]
-        text_resp=text_resp.strip().strip("\n")
-        text_resp=cls.sanitise_text_resp(text_resp)
-        if "next_thought:" in text_resp and "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_thought:")<text_resp.find("next_tool_name:") and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:"):
-            next_thought=text_resp.split("next_thought:")[1].split("next_tool_name:")[0].strip().strip("\n")
-            next_tool_name_raw=text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n")
-            next_tool_args_raw=text_resp.split("next_tool_args:")[1].strip().split("next_thought:")[0].strip().strip("\n")
+    # --------------------------------------------------------------------
+    # Embed problem text and all chunks ----------------------------------
+    # --------------------------------------------------------------------
+
+    query_vec = _remote_embed(problem_text, proxy_url, run_id)
+    chunk_vecs: List[List[float]] = [None] * len(chunk_texts)  # type: ignore
+
+    MAX_WORKERS = min(8, int(os.getenv("EMBED_CONCURRENCY", "8")))  # Increased concurrency
+
+    print(f"[Agent] Embedding {len(chunk_texts)} chunks with {MAX_WORKERS} workers")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        fut_to_idx = {pool.submit(safe_remote_embed, txt, proxy_url, run_id): idx for idx, txt in enumerate(chunk_texts)}
+
+        for fut in as_completed(fut_to_idx):
+            idx = fut_to_idx[fut]
             try:
-                # Enforce arrays per new contract: if single string/object, wrap as arrays
-                if next_tool_name_raw.startswith("["):
-                    next_tool_name = Utils.load_json(next_tool_name_raw)
-                else:
-                    next_tool_name = [next_tool_name_raw]
-                parsed_args = cls.parse_next_tool_args(next_tool_name, next_tool_args_raw)
-                if isinstance(parsed_args, list):
-                    next_tool_args = parsed_args
-                else:
-                    next_tool_args = [parsed_args for _ in next_tool_name]
-            except JSONDecodeError as e:
-                error_msg=f"Invalid JSON: {str(e)}"
-                Utils.log_to_failed_messages(text_resp)
-                
+                chunk_vecs[idx] = fut.result()
+            except Exception as exc:
+                # Log and keep zero vector; retrieval will simply rank it low.
+                print(f"[agent] embedding error (chunk {idx}): {exc}")
+                chunk_vecs[idx] = ZERO_VEC
+
+    sims = [ _cosine(vec, query_vec) for vec in chunk_vecs ]
+
+    # --------------------------------------------------------------------
+    # Light path-based bonus if filename is mentioned in the problem text --
+    # --------------------------------------------------------------------
+    prob_lower = problem_text.lower()
+    for idx, ch in enumerate(code_chunks):
+        base = os.path.basename(ch.file).lower()
+        if base in prob_lower or base.split(".")[0] in prob_lower:
+            sims[idx] += 0.2
+
+    sorted_idx = sorted(range(len(sims)), key=lambda i: -sims[i])
+
+    TARGET_TOKENS = 6_000  # Reduced from 12_000 for faster processing
+    token_budget = int(TARGET_TOKENS * 0.85)
+    token_total = 0
+    top_idx: list[int] = []
+    for idx in sorted_idx:
+        tok = _guess_tokens(chunk_texts[idx])
+        if token_total + tok > token_budget:
+            break
+        token_total += tok
+        top_idx.append(idx)
+
+    # Fallback to at most top_k if budget yields too many
+    if len(top_idx) > top_k:
+        top_idx = top_idx[:top_k]
+
+    summary_parts: list[str] = []
+    for idx in top_idx:
+        ch = code_chunks[idx]
+        body = ch.text[:5000]
+        tag = _lang_tag(ch.file)
+        header = f"### {ch.file}:L{ch.start_line}-{ch.end_line}"
+        summary_parts.append(f"{header}\n```{tag}\n{body}\n```")
+
+    repo_summary = "\n\n".join(summary_parts)
+
+    # --------------------------------------------------------------------
+    # Build initial conversation messages.
+    # --------------------------------------------------------------------
+
+    print(f"[Agent] Repository summary: {len(repo_summary)} chars, {len(top_idx)} chunks, {token_total} tokens")
+    print(f"[Agent] repo_summary:\n{repo_summary}")
+    messages = [
+        {"role": "system", "content": ONESHOT_SYSTEM_PROMPT},
+        {"role": "user", "content": problem_text},
+        {"role": "user", "content": "Repository summary (top files):\n\n" + repo_summary},
+    ]
+
+    proxy_resp = inference_for_oneshot_embedding(messages, proxy_url, run_id, model_name)
+
+    print(f"[agent] Proxy response received: {proxy_resp}")
+    code_resp = proxy_resp.get("code_response", "")
+
+    patch_text = None
+    # if code_resp and (code_resp.startswith("diff") or code_resp.startswith("--- ")):
+    patch_text = code_resp
+    # Sanitize diff to strip markdown fences and chatter
+    patch_text = _sanitize_patch(patch_text)
+    print(f"[agent] Sanitized patch : {patch_text}")
+
+    ok, dry_out = _dry_run_patch(patch_text)
+    if ok:
+        result = _apply_patch(patch_text)
+        print(f"[agent] Patch applied. patch:\n{patch_text}\n{result}")
+        return patch_text
+    else:
+        print(f"[agent] Patch failed to apply. patch:\n'{patch_text}'\n{dry_out}")
+        # Patch failed – append feedback and ask for correction.
+        messages.append({"role": "assistant", "content": code_resp[:200]})
+        messages.append({"role": "user", "content": "Patch failed to apply. Please reply with a corrected unified diff only."})
+        raise RuntimeError(f"[agent] Patch could not be applied through oneshot embedding.")
+
+
+def safe_remote_embed(text, proxy_url, run_id, max_retries=3):  # Reduced retries from 5 to 3
+    for attempt in range(max_retries):
+        try:
+            return _remote_embed(text, proxy_url, run_id)
+        except Exception as e:
+            sleep_time = 2  # Reduced sleep time from 10 to 2 seconds
+            print(f"Rate limited, retrying in {sleep_time:.1f}s...")
+            time.sleep(sleep_time)
+    return ZERO_VEC
+
+
+def _apply_patch(patch: str) -> str:
+    """Apply a git patch and return the result."""
+    try:
+        # Write patch to temporary file
+        with open(".temp_patch", "w") as f:
+            f.write(patch)
+        
+        # Apply the patch
+        result = subprocess.run(
+            ["git", "apply", ".temp_patch"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode == 0:
+            # Generate final patch
+            final_patch = subprocess.run(
+                ["git", "diff"],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            return final_patch.stdout
         else:
-            if "next_thought:" not in text_resp:
-                error_msg="Invalid response. next_thought not found"
-            elif "next_tool_name:" not in text_resp:
-                error_msg="Invalid response. next_tool_name not found"
-            elif "next_tool_args:" not in text_resp:
-                error_msg="Invalid response. next_tool_args not found"
-            elif text_resp.find("next_thought:")>text_resp.find("next_tool_name:"):
-                error_msg="Invalid response. next_thought is after next_tool_name"
-            elif text_resp.find("next_tool_name:")>text_resp.find("next_tool_args:"):
-                error_msg="Invalid response. next_tool_name is after next_tool_args"
-            else:
-                logger.error(f"We have no clue why parsing failed. Please check this \n{text_resp}\n")
-            Utils.log_to_failed_messages(text_resp)
-            return None,None,None,error_msg
-
-        if len(next_tool_name) == 1:
-            return next_thought, next_tool_name[0], next_tool_args[0], error_msg
+            print(f"Patch application failed: {result.stderr}")
+            return ""
             
-        return next_thought, next_tool_name, next_tool_args,error_msg
+    except Exception as e:
+        print(f"Error applying patch: {e}")
+        return ""
+    finally:
+        # Clean up temporary file
+        try:
+            os.remove(".temp_patch")
+        except:
+            pass
+
+
+def inference_for_oneshot_embedding(messages: List[Dict[str, Any]], proxy_url: str, run_id: str, model: str = None) -> dict:
+    """Send inference request to the proxy and return the response."""
+    # Build request data
+    request_data = {
+        "run_id": run_id,
+        "messages": messages,
+        "temperature": 0
+    }
+    
+    if model:
+        request_data["model"] = model
+
+    # Send HTTP request
+    url = f"{proxy_url.rstrip('/')}/api/inference"
+    request_bytes = json.dumps(request_data, ensure_ascii=False).encode('utf-8')
+    
+    print(f"[agent] Making inference request to {url}")
+    
+    try:
+        req = _urlreq.Request(url, data=request_bytes, method="POST")
+        req.add_header("Content-Type", "application/json")
+        
+        with _urlreq.urlopen(req, timeout=120) as resp:  # Reduced timeout from 600 to 120
+            response_chunks = []
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                response_chunks.append(chunk)
+            response_body = b"".join(response_chunks)
+            # response_body = resp.read()
+            print(f"[agent] HTTP {resp.status} from {url} ({len(response_body)} bytes)")
+            
+            response_txt = response_body.decode("utf-8")
+            response_json = json.loads(response_txt)
+            
+            # The proxy may return a plain string instead of a JSON object with
+            # separate text / code fields.  In that case we wrap it in the
+            # expected shape so downstream logic can stay unchanged.
+           
+            if isinstance(response_json, str):
+                if response_json.find("code_response") != -1:
+                    response_json = json.loads(response_json)
+                else:
+                    raw_text: str = response_json
+                    # Attempt to separate a unified diff from the explanatory text.
+                    diff_start = None
+                    if raw_text.startswith("diff") or raw_text.startswith("--- "):
+                        diff_start = 0
+                    else:
+                        # Look for the first occurrence of a diff header inside the text.
+                        for marker in ("\ndiff --git", "\n--- "):
+                            idx = raw_text.find(marker)
+                            if idx != -1:
+                                diff_start = idx + 1  # skip the leading newline
+                                break
+
+                    code_resp = raw_text
+                    if diff_start is not None:
+                        code_resp = raw_text[diff_start:].lstrip()
+
+                    response_json = {"code_response": code_resp}
+
+            return response_json
+
+            
+    except Exception as e:
+        print(f"[agent] Inference request failed: {e}")
+        raise RuntimeError(f"Inference request failed: {e}")
+
+
+def _sanitize_patch(patch: str) -> str:
+    """Return *patch* stripped of markdown/code-fence chatter.
+
+    The LLM sometimes wraps the unified diff in Markdown fences or appends
+    explanatory text (e.g. `DISCUSSION`, `EOF`).  This helper keeps only the
+    lines that are valid in a unified diff so downstream tools (`patch`,
+    `git apply`) succeed and the resulting patch file is clean.
+    """
+    # Stop at the first closing code fence (```), if present.
+    stop_idx = patch.find("\n```")
+    if stop_idx != -1:
+        patch = patch[:stop_idx]
+
+    allowed_prefixes = (
+        "diff --git",
+        "index ",
+        "--- ",
+        "+++ ",
+        "@@",
+        "new file mode",
+        "deleted file mode",
+        "similarity index",
+        "rename from",
+        "rename to",
+        "Binary files",
+        "\\ No newline",
+    )
+
+    cleaned_lines: list[str] = []
+    for line in patch.splitlines():
+        # Early exit markers – anything after is junk.
+        if line.strip() in {"DISCUSSION", "EOF"}:
+            break
+        if line.startswith(allowed_prefixes):
+            cleaned_lines.append(line)
+            continue
+        # Hunk content lines start with space, plus or minus.
+        if line.startswith(("+", "-", " ")):
+            cleaned_lines.append(line)
+            continue
+        # Ignore everything else (markdown, commentary, empty lines outside hunks).
+
+    # Post-process header lines: ensure 'a/' and 'b/' prefixes so a default
+    # `patch -p1` invocation resolves correctly when run from the repository
+    # root.  We intentionally *do not* touch paths pointing to /dev/null.
+    for idx, ln in enumerate(cleaned_lines):
+        if ln.startswith("--- ") and not ln.startswith("--- a/") and not ln.startswith("--- /dev/null"):
+            cleaned_lines[idx] = "--- a/" + ln[4:]
+        elif ln.startswith("+++ ") and not ln.startswith("+++ b/") and not ln.startswith("+++ /dev/null"):
+            cleaned_lines[idx] = "+++ b/" + ln[4:]
+
+    return "\n".join(cleaned_lines) + "\n"
+
+
+def _dry_run_patch(patch: str) -> tuple[bool, str]:
+    """Validate patch without applying it."""
+    try:
+        # Sanitize the patch first
+        sanitized_patch = _sanitize_patch(patch)
+        
+        if not sanitized_patch.strip():
+            return False, "Empty patch"
+        
+        # Write to temporary file
+        with open(".temp_patch", "w") as f:
+            f.write(sanitized_patch)
+        
+        # Try to apply with --check flag
+        result = subprocess.run(
+            ["git", "apply", "--check", ".temp_patch"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        return result.returncode == 0, result.stderr
+        
+    except Exception as e:
+        return False, str(e)
+    finally:
+        # Clean up
+        try:
+            os.remove(".temp_patch")
+        except:
+            pass
+
+
+def process_task_with_oneshot_embedding(input_dict: Dict[str, Any]):
+    """Process task using oneshot embedding approach."""
+    problem_text = input_dict.get("problem_statement")
+    result = run_oneshot(
+        problem_text,
+        proxy_url=DEFAULT_PROXY_URL,
+        model_name=EMBED_MODEL_NAME,
+        run_id=RUN_ID,
+    )
+
+    return result
+
 
 def ensure_git_initialized():
     """Initialize git repository if not already initialized, with temporary config."""
@@ -2047,8 +3140,140 @@ def set_env_for_agent():
     if Path(os.getcwd()+"/lib").exists() and os.getcwd()+"/lib" not in os.environ.get("PYTHONPATH",""):
         os.environ["PYTHONPATH"]=os.environ["PYTHONPATH"]+":"+os.getcwd()+"/lib"
 
+def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo", test_mode: bool = False):
+    """Legacy interface wrapper for backwards compatibility."""
+    global DEFAULT_PROXY_URL, REPO_DIR, DEFAULT_TIMEOUT, MAX_TEST_PATCH_TIMEOUT, RUN_ID, run_id
+    RUN_ID = os.getenv("RUN_ID", "")
+    run_id = os.getenv("RUN_ID", "")
+    repo_dir = os.path.abspath(repo_dir)
+    REPO_DIR = repo_dir
+    if test_mode:
+        DEFAULT_TIMEOUT = 1000
+        MAX_TEST_PATCH_TIMEOUT = 400
 
-def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
+    sys.path.insert(0, repo_dir)
+
+    if os.path.exists(repo_dir):
+        os.chdir(repo_dir)
+
+    ensure_git_initialized()
+
+    set_env_for_agent()
+
+    # Check problem type first
+    problem_type = check_problem_type(input_dict.get("problem_statement"))
+    
+    if problem_type == PROBLEM_TYPE_FIX:
+        # Use embedding-based approach for FIX tasks
+        try:
+            result = process_task_with_oneshot_embedding(input_dict)
+        except Exception as e:
+            print(f"[agent] Error occurred while processing with oneshot embedding: {e}")
+            print(f"[agent] Falling back to traditional FIX workflow...")
+            result = process_fix_task(input_dict)
+    else:
+        # Use traditional approach for CREATE tasks
+        result = process_create_task(input_dict)
+
+    os.system("git reset --hard")
+
+    return result
+
+def check_problem_type(problem_statement: str) -> str:
+    retry = 0
+    while retry < 10:
+        try:
+            messages = [
+                {"role": "system", "content": PROBLEM_TYPE_CHECK_PROMPT},
+                {"role": "user", "content": f"{problem_statement}\n# Project Tree Structure: \n{get_directory_tree()}"}
+            ]
+            
+            response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
+
+            if response not in [PROBLEM_TYPE_CREATE, PROBLEM_TYPE_FIX]:
+                retry += 1
+            else:
+                break
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            retry += 1
+        
+        time.sleep(2)
+
+    return response
+
+def post_process_instruction(instruction: str) -> str:
+    """
+    Post-processes instruction to mark whitespaces and empty lines explicitly.
+    """
+    import re
+    
+    def apply_markup(text_block: str) -> str:
+        """
+        Apply markup to make whitespaces and empty lines explicit to make llm not confusing and ignoring them.
+        For example, if the text block is:
+
+        ```text
+        This is a test.
+
+        This is another test!
+        ```text
+
+        Then the text block should be:
+
+        ```
+        This is a test.
+        [EMPTY_LINE]
+        This is another test!
+        ```
+        """
+        lines = text_block.split('\n')
+        processed_lines = []
+        
+        should_apply_markup = True
+        for line in lines:
+            if line.strip() == '':
+                should_apply_markup = True
+                break
+            if line[-1] != "." and line[-1] != "!":
+                should_apply_markup = False
+                break
+            
+        if should_apply_markup == False:
+            return text_block
+
+        for i, line in enumerate(lines):
+            if line.strip() == '':                
+                processed_line = '[EMPTY_LINE]'
+            else:
+                # Mark trailing and leading spaces
+                leading_spaces = len(line) - len(line.lstrip(' '))
+                trailing_spaces = len(line) - len(line.rstrip(' '))
+                
+                processed_line = line
+                if leading_spaces > 0:
+                    processed_line = f'[{leading_spaces}_LEADING_SPACES]' + line.lstrip(' ')
+                if trailing_spaces > 0:
+                    processed_line = processed_line.rstrip(' ') + f'[{trailing_spaces}_TRAILING_SPACES]'
+            
+            processed_lines.append(f"\"{processed_line}\"")
+        
+        return "[\n    " + ",\n    ".join(processed_lines) + "\n]"
+            
+    # Pattern to match ```text...``` blocks
+    pattern = r'```text\n(.*?)\n```'
+    
+    def replace_text_block(match):
+        text_content = match.group(1)
+        processed_content = apply_markup(text_content)
+        
+        return f'```text\n{processed_content}\n```'
+    
+    # Replace all text blocks with processed versions
+    processed_instruction = re.sub(pattern, replace_text_block, instruction, flags=re.DOTALL)
+    return processed_instruction
+
+def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str, requirement: str, architecture: str) -> str:
     retry = 0
     code_generation_messages = [
         {
@@ -2057,27 +3282,14 @@ def generate_solution_with_multi_step_reasoning(problem_statement: str, code_ske
         },
         {
             "role": "user",
-            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
+            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nRequirement document:\n{requirement}\n\nArchitecture:\n{architecture}\n\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
         }
     ]
     while retry < 10:
         try:
             code_response = EnhancedNetwork.make_request(code_generation_messages, model=QWEN_MODEL_NAME)
-            
-            loop_check_messages = [
-                {
-                    "role": "system",
-                    "content": INFINITE_LOOP_CHECK_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": f"Generated Code:\n{code_response}\n\nAnalyze this code for potential infinite loops and provide a corrected version if any issues are found. Return ONLY the final Python code."
-                }   
-            ]
-            
-            loop_check_response = EnhancedNetwork.make_request(loop_check_messages, model=QWEN_MODEL_NAME)
 
-            solution = loop_check_response.strip()
+            solution = code_response.strip()
             if solution.startswith('```python'):
                 solution = solution[9:]
             if solution.startswith('```'):
@@ -2091,31 +3303,37 @@ def generate_solution_with_multi_step_reasoning(problem_statement: str, code_ske
                 retry += 1
                 code_generation_messages.append({"role": "assistant", "content": code_response})
                 code_generation_messages.append({"role": "user", "content": f"Include file name in the response. example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"})
+                print(f"Retrying because the first line is not a python file name:\n {solution}")
                 continue
 
+            logger.info("Multi-step reasoning solution generation completed successfully with infinite loop validation")
             return solution
         except Exception as e:
             retry += 1
-            if retry < 10:
-                time.sleep(2)
+            print(f"Exception in generate_solution_with_multi_step_reasoning: {e}")
+            time.sleep(2)
     
-    logger.error("[MULTI_STEP] Failed after 10 attempts")
+    if retry >= 10:
+        logger.error("Multi-step reasoning solution generation failed")
+        return ""
+    
     return ""
 
-def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
+def generate_initial_solution(problem_statement: str, code_skeleton: str, requirement: str, architecture: str) -> str:
     retry = 0
     while retry < 10:
         try:
-            logger.info(f"[GENERATE_SOLUTION] Attempt {retry + 1}/10 - trying multi-step")
-            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton)
+            logger.info("Starting multi-step reasoning solution generation")
+            
+            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton, requirement, architecture)
             
             if solution:
-                logger.info(f"[GENERATE_SOLUTION] Multi-step succeeded ({len(solution)} chars)")
+                logger.info("Generated initial solution successfully using multi-step reasoning")
                 return solution
             else:
-                logger.warning("[GENERATE_SOLUTION] Multi-step failed, trying fallback")
+                logger.warning("Multi-step reasoning failed, falling back to single-step approach")
                 
-                # Fallback to single-step approach
+                # Fallback to original single-step approach if multi-step fails
                 messages = [
                     {
                         "role": "system",
@@ -2123,7 +3341,7 @@ def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str
                     },
                     {
                         "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files."""
+                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nRequirement document:\n{requirement}\n\nArchitecture:\n{architecture}\n\nGenerate the complete and correct implementation in python files."""
                     }
                 ]
                 
@@ -2139,15 +3357,16 @@ def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str
                     solution = solution[:-3]
                 solution = solution.strip()
                 
-                logger.info(f"[GENERATE_SOLUTION] Fallback succeeded ({len(solution)} chars)")
+                logger.info("Generated initial solution successfully using fallback approach")
                 return solution
             
         except Exception as e:
-            logger.error(f"[GENERATE_SOLUTION] Exception: {e}")
+            logger.error(f"Error generating initial solution: {str(e)}")
             retry += 1
             time.sleep(2)
+    
     if retry >= 10:
-        logger.error("[GENERATE_SOLUTION] Failed after 10 attempts")
+        logger.error("Failed to generate initial solution")
         return ""
     return ""
 
@@ -2267,7 +3486,6 @@ def generate_test_files(problem_statement: str, files_to_test: str, code_skeleto
 
 def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
     import os
-    import re
     
     created_files = []
     
@@ -2522,42 +3740,52 @@ def enhance_solution_with_constants(problem_statement: str, initial_solution: st
     except Exception as e:
         logger.error(f"[ENHANCE] Enhancement failed: {e}, using original")
         return initial_solution
-
-
-
-def process_create_task(input_dict):
-    logger.info("[CREATE_TASK] Starting create task workflow")
     
-    # Process problem statement
+def process_create_task(input_dict):
+    start_time = time.time()
     problem_statement = input_dict.get("problem_statement", "")
     problem_statement = post_process_instruction(problem_statement)
-    print(problem_statement)
-
+    def requirement_analysis(proplem_statement: str, code_skeleton: str) -> str:
+        prompt = REQUIREMENT_ANALYSIS_PROMPT.format(
+        problem_statement=problem_statement,
+        code_skeleton=code_skeleton
+            )
+        messages = [
+            {"role": "system", "content": "You are a expert software requirements analyst. Generate comprehensive, well-structured requirement documents that are immediately actionable for development teams."},
+            {"role": "user", "content": prompt}
+            ]
+        response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME)
+        return response if response else ""
+    requirement = requirement_analysis(problem_statement, code_skeleton)
+    def architecture_analyzer(problem_statement: str, code_skeleton: str, requirement: str) -> str:
+        prompt = ARCHITECTURE_ANALYSIS_PROMPT.format(
+            problem_statement=problem_statement,
+            code_skeleton=code_skeleton,
+            requirement_document=requirement
+            )
+        messages = [
+        {
+            "role": "system", 
+            "content": "You are a principal software architect. Provide complete technical specifications without omissions or examples."
+        },
+        {
+            "role": "user", 
+            "content": prompt
+        }]
+        response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME,)
+        return response if response else ''
+    architecture = architecture_analyzer(problem_statement=problem_statement, code_skeleton=code_skeleton, requirement=requirement)
+    
     code_skeleton = get_code_skeleton()
-    start_time = time.time()
-    initial_solution = generate_initial_solution(problem_statement, code_skeleton)
-    
-    # Enhance solution with missing constants
+    initial_solution = generate_initial_solution(problem_statement, code_skeleton, requirement, architecture)
     initial_solution = enhance_solution_with_constants(problem_statement, initial_solution)
-    
-    # Fix lazy property generation issues
     initial_solution = fix_lazy_property_generation(problem_statement, initial_solution)
-    
-    # Fix recursive word definition issues
     initial_solution = fix_recursive_word_definitions(problem_statement, initial_solution)
     
-    generation_time = time.time() - start_time
-    logger.info(f"[CREATE_TASK] Solution generated in {generation_time:.2f}s ({len(initial_solution)} chars)")
-    print(initial_solution)
-    
-    # Extract and write files
     created_files = extract_and_write_files(initial_solution)
-    logger.info(f"[CREATE_TASK] Created {len(created_files)} files: {created_files}")
-    print(f"Created or Updated {len(created_files)} files: {created_files}")
+
     test_cases = generate_test_files(problem_statement, created_files, code_skeleton)
-    print(test_cases)
-    test_files = extract_and_write_files(test_cases)
-    print(f"Created or Updated {len(test_files)} files: {test_files}")
+    extract_and_write_files(test_cases)
 
     timeout = DEFAULT_TIMEOUT - (time.time()-start_time) - 60
     
@@ -2570,27 +3798,18 @@ def process_create_task(input_dict):
         test_runner_mode="FILE",
         n_max_steps=30
     )
-    if patch is None: # Failed to fix by testcases, maybe testcases are wrong so try to use original solution
+
+    if patch is None:
+        print("Patch is None")
         extract_and_write_files(initial_solution)
     
-    print(f"\n\nThis is patch\n\n{patch}\n\n")
-    # Enhance solution with missing constants
     patch = enhance_solution_with_constants(problem_statement, patch)
-    
-    # Fix lazy property generation issues
     patch = fix_lazy_property_generation(problem_statement, patch)
-    
-    # Fix recursive word definition issues
     patch = fix_recursive_word_definitions(problem_statement, patch)
-    extract_and_write_files(initial_solution)
-    # Generate git patch
+    
+    extract_and_write_files(patch)
     tool_manager = EnhancedToolManager()
     patch = tool_manager.get_final_git_patch()
-    logger.info(f"[CREATE_TASK] Git patch generated ({len(patch)} chars)")
-    
-    total_time = time.time() - start_time
-    logger.info(f"[CREATE_TASK] Workflow completed in {total_time:.2f}s")
-    
     return patch
 
 def get_code_skeleton() -> str:
@@ -2792,65 +4011,56 @@ def get_test_runner_and_mode():
     return test_runner, test_runner_mode
 
 def process_fix_task(input_dict: Dict[str, Any]):
-    """Main entry point for task processing and code modification.
-
-    Parameters
-    ----------
-    input_dict : dict
-        Configuration dictionary containing the task specification.
-        Required key: 'problem_statement' with task details.
-        Optional keys: 'run_id', 'instance_id' for tracking purposes.
-    """
-    global run_id
-    # setting environment to include current working directory and lib directory
-    problem_text = input_dict.get("problem_statement")
-    if not problem_text:
-        raise ValueError("input_dict must contain 'problem_statement'.")
-    timeout = int(os.getenv("AGENT_TIMEOUT", str(DEFAULT_TIMEOUT)))
+    """Main entry point for FIX task processing using embedding-based approach."""
+    global RUN_ID, REPO_DIR
     
-    logs = []
-    patch_text = ""  # Initialize to avoid UnboundLocalError
+    # Set up environment
+    RUN_ID = os.getenv("RUN_ID", "")
+    repo_dir = os.getenv("REPO_PATH", "/sandbox/repo")
+    repod_dir = repo_dir.split('/')[-1]
+    repod_path = repo_dir[:-len(repod_dir)-1]
     
-    repo_path = os.getenv("REPO_PATH", "/sandbox/repo")
-    repod_dir = repo_path.split('/')[-1]
-    repod_path = repo_path[:-len(repod_dir)-1]
     if os.path.exists(repod_dir):
         os.chdir(repod_dir)
-
-    set_env_for_agent()
-    cwd = os.getcwd()
-    logger.info(f"Current working directory: {cwd} and environ:{os.environ}")
     
-    test_runner, test_runner_mode = get_test_runner_and_mode()
-    print(f"test_runner: {test_runner}, test_runner_mode: {test_runner_mode}")
-
+    REPO_DIR = os.getcwd()
+    set_env_for_agent()
+    
+    logger.info(f"Current working directory: {os.getcwd()}")
+    
     try:
-        logger.info(f"current files:{os.listdir()}")
-        logger.info(f"packages installed:{subprocess.check_output(['pip','list']).decode('utf-8')}")
-        logger.info(f"About to execute workflow...")
-        patch_text= fix_task_solve_workflow(
-            problem_text,
-            timeout=timeout,
-            run_id_1=run_id,
-            instance_id="",
-            test_runner=test_runner,
-            test_runner_mode=test_runner_mode
-        )
-        logger.info(f"workflow execution completed, patch length: {len(patch_text)}")
-
+        logger.info(f"About to execute embedding-based FIX workflow...")
+        
+        # Use embedding-based approach for FIX tasks
+        result = process_task_with_oneshot_embedding(input_dict)
+        
+        logger.info(f"Embedding-based workflow completed, result length: {len(result) if result else 0}")
+        
+        # Reset git state
         os.system("git reset --hard")
-
+        
+        return result
+        
     except Exception as e:
-        import traceback  # Ensure traceback is accessible
+        import traceback
         error_info = f"Error: {e}, {traceback.format_exc()}"
-        logger.error(f"[CRITICAL] Exception in task processing: {error_info}")
-        logs.append(error_info)
-    finally:
-        os.chdir(cwd)
-
-    print(f"[CRITICAL] task processor returning patch length: {len(patch_text)}")
-    print(f"[CRITICAL] patch: {patch_text}")
-    return patch_text
+        logger.error(f"[CRITICAL] Exception in embedding-based FIX task processing: {error_info}")
+        
+        # Fallback to traditional approach if embedding fails
+        logger.info("Falling back to traditional FIX workflow...")
+        try:
+            result = fix_task_solve_workflow(
+                input_dict.get("problem_statement", ""),
+                timeout=DEFAULT_TIMEOUT,
+                run_id_1=RUN_ID,
+                instance_id="",
+                test_runner="pytest",
+                test_runner_mode="FILE"
+            )
+            return result
+        except Exception as fallback_error:
+            logger.error(f"Fallback also failed: {fallback_error}")
+            return ""
 
 def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str, instance_id: str = "", \
     test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
@@ -2960,132 +4170,3 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
     logger.info(f"Final Patch Generated..: Length: {len(patch)}")
 
     return patch
-
-
-def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo", test_mode: bool = False):
-    """Legacy interface wrapper for backwards compatibility."""
-    global DEFAULT_PROXY_URL, REPO_DIR, DEFAULT_TIMEOUT, MAX_TEST_PATCH_TIMEOUT, run_id
-    run_id = os.getenv("RUN_ID", "")
-    repo_dir = os.path.abspath(repo_dir)
-    REPO_DIR = repo_dir
-    if test_mode:
-        DEFAULT_TIMEOUT = 1000
-        MAX_TEST_PATCH_TIMEOUT = 400
-
-    sys.path.insert(0, repo_dir)
-
-
-    if os.path.exists(repo_dir):
-        os.chdir(repo_dir)
-
-    ensure_git_initialized()
-
-    set_env_for_agent()
-
-    try:
-        problem_type = check_problem_type(input_dict.get("problem_statement"))
-
-        if problem_type == PROBLEM_TYPE_FIX:
-            result = process_fix_task(input_dict)
-        else:
-            result = process_create_task(input_dict)
-    except Exception as e:
-        result = process_fix_task(input_dict)
-
-    os.system("git reset --hard")
-
-    return result
-
-def check_problem_type(problem_statement: str) -> str:
-    retry = 0
-    while retry < 10:
-        try:
-            messages = [
-                {"role": "system", "content": PROBLEM_TYPE_CHECK_PROMPT},
-                {"role": "user", "content": f"{problem_statement}\n# Project Tree Structure: \n{get_directory_tree()}"}
-            ]
-            
-            response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
-
-            if response not in [PROBLEM_TYPE_CREATE, PROBLEM_TYPE_FIX]:
-                retry += 1
-            else:
-                break
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            retry += 1
-        
-        time.sleep(2)
-
-    return response
-
-def post_process_instruction(instruction: str) -> str:
-    """
-    Post-processes instruction to mark whitespaces and empty lines explicitly.
-    """
-    import re
-    
-    def apply_markup(text_block: str) -> str:
-        """
-        Apply markup to make whitespaces and empty lines explicit to make llm not confusing and ignoring them.
-        For example, if the text block is:
-
-        ```text
-        This is a test.
-
-        This is another test!
-        ```text
-
-        Then the text block should be:
-
-        ```
-        This is a test.
-        [EMPTY_LINE]
-        This is another test!
-        ```
-        """
-        lines = text_block.split('\n')
-        processed_lines = []
-        
-        should_apply_markup = True
-        for line in lines:
-            if line.strip() == '':
-                should_apply_markup = True
-                break
-            if line[-1] != "." and line[-1] != "!":
-                should_apply_markup = False
-                break
-            
-        if should_apply_markup == False:
-            return text_block
-
-        for i, line in enumerate(lines):
-            if line.strip() == '':                
-                processed_line = '[EMPTY_LINE]'
-            else:
-                # Mark trailing and leading spaces
-                leading_spaces = len(line) - len(line.lstrip(' '))
-                trailing_spaces = len(line) - len(line.rstrip(' '))
-                
-                processed_line = line
-                if leading_spaces > 0:
-                    processed_line = f'[{leading_spaces}_LEADING_SPACES]' + line.lstrip(' ')
-                if trailing_spaces > 0:
-                    processed_line = processed_line.rstrip(' ') + f'[{trailing_spaces}_TRAILING_SPACES]'
-            
-            processed_lines.append(f"\"{processed_line}\"")
-        
-        return "[\n    " + ",\n    ".join(processed_lines) + "\n]"
-            
-    # Pattern to match ```text...``` blocks
-    pattern = r'```text\n(.*?)\n```'
-    
-    def replace_text_block(match):
-        text_content = match.group(1)
-        processed_content = apply_markup(text_content)
-        
-        return f'```text\n{processed_content}\n```'
-    
-    # Replace all text blocks with processed versions
-    processed_instruction = re.sub(pattern, replace_text_block, instruction, flags=re.DOTALL)
-    return processed_instruction
