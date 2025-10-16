@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 import math
 
+
 PROBLEM_TYPE_CREATE = "CREATE"
 PROBLEM_TYPE_FIX = "FIX"
 
@@ -46,7 +47,7 @@ GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
 KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
 DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
 QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
-AGENT_MODELS=[GLM_MODEL_NAME, KIMI_MODEL_NAME, DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]
+AGENT_MODELS=[QWEN_MODEL_NAME, DEEPSEEK_MODEL_NAME, KIMI_MODEL_NAME, GLM_MODEL_NAME]
 MAX_FIX_TASK_STEPS = 400
 
 PROBLEM_TYPE_CHECK_PROMPT = textwrap.dedent(
@@ -346,6 +347,10 @@ You have access to the following tools:-
 FIX_TASK_INSTANCE_PROMPT_TEMPLATE = textwrap.dedent("""
 # Now let's start. Here is the problem statement:
 {problem_statement}
+Problem requirement document:
+{requirement}
+Problem Architecture:
+{architecture}
 """)
 
 
@@ -385,6 +390,8 @@ Generate a comprehensive, well-structured requirement analysis document by syste
 
 ### CODE SKELETON:
 {code_skeleton}
+
+**Confirmed Task Type:** {task_type}
 
 ## DOCUMENT STRUCTURE REQUIREMENTS
 
@@ -847,7 +854,7 @@ class EnhancedCOT:
             self.inference_error_counter=inference_error_counter
             self.request_data=request_data
             self.is_deleted=False
-    def __init__(self,latest_observations_to_keep=5):
+    def __init__(self,latest_observations_to_keep=30):
         self.thoughts: list[EnhancedCOT.Action] = []
         self.latest_observations_to_keep=latest_observations_to_keep
         
@@ -3148,9 +3155,9 @@ def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo", test_mode: bo
     repo_dir = os.path.abspath(repo_dir)
     REPO_DIR = repo_dir
     if test_mode:
-        DEFAULT_TIMEOUT = 1000
+        DEFAULT_TIMEOUT = 1156
         MAX_TEST_PATCH_TIMEOUT = 400
-
+    
     sys.path.insert(0, repo_dir)
 
     if os.path.exists(repo_dir):
@@ -3166,7 +3173,7 @@ def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo", test_mode: bo
     if problem_type == PROBLEM_TYPE_FIX:
         # Use embedding-based approach for FIX tasks
         try:
-            result = process_task_with_oneshot_embedding(input_dict)
+            result = process_fix_task(input_dict)#process_task_with_oneshot_embedding(input_dict)
         except Exception as e:
             print(f"[agent] Error occurred while processing with oneshot embedding: {e}")
             print(f"[agent] Falling back to traditional FIX workflow...")
@@ -3745,10 +3752,12 @@ def process_create_task(input_dict):
     start_time = time.time()
     problem_statement = input_dict.get("problem_statement", "")
     problem_statement = post_process_instruction(problem_statement)
+    code_skeleton = get_code_skeleton()
     def requirement_analysis(proplem_statement: str, code_skeleton: str) -> str:
         prompt = REQUIREMENT_ANALYSIS_PROMPT.format(
         problem_statement=problem_statement,
-        code_skeleton=code_skeleton
+        code_skeleton=code_skeleton,
+        task_type="CREATE"
             )
         messages = [
             {"role": "system", "content": "You are a expert software requirements analyst. Generate comprehensive, well-structured requirement documents that are immediately actionable for development teams."},
@@ -3757,11 +3766,13 @@ def process_create_task(input_dict):
         response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME)
         return response if response else ""
     requirement = requirement_analysis(problem_statement, code_skeleton)
+    logger.info(f"[REQUIREMENT]\n{requirement}")
     def architecture_analyzer(problem_statement: str, code_skeleton: str, requirement: str) -> str:
         prompt = ARCHITECTURE_ANALYSIS_PROMPT.format(
             problem_statement=problem_statement,
             code_skeleton=code_skeleton,
-            requirement_document=requirement
+            requirement_document=requirement,
+            task_type="CREATE"
             )
         messages = [
         {
@@ -3775,6 +3786,7 @@ def process_create_task(input_dict):
         response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME,)
         return response if response else ''
     architecture = architecture_analyzer(problem_statement=problem_statement, code_skeleton=code_skeleton, requirement=requirement)
+    logger.info(f"[ARCHITECTURE]\n{architecture}")
     
     code_skeleton = get_code_skeleton()
     initial_solution = generate_initial_solution(problem_statement, code_skeleton, requirement, architecture)
@@ -3796,16 +3808,15 @@ def process_create_task(input_dict):
         instance_id="",
         test_runner=f"unittest",
         test_runner_mode="FILE",
-        n_max_steps=30
+        n_max_steps=100,
+        requirement=requirement,
+        architecture=architecture
     )
 
     if patch is None:
         print("Patch is None")
         extract_and_write_files(initial_solution)
     
-    patch = enhance_solution_with_constants(problem_statement, patch)
-    patch = fix_lazy_property_generation(problem_statement, patch)
-    patch = fix_recursive_word_definitions(problem_statement, patch)
     
     extract_and_write_files(patch)
     tool_manager = EnhancedToolManager()
@@ -4022,9 +4033,44 @@ def process_fix_task(input_dict: Dict[str, Any]):
     
     if os.path.exists(repod_dir):
         os.chdir(repod_dir)
-    
+    problem_statement=input_dict.get("problem_statement", "")
     REPO_DIR = os.getcwd()
     set_env_for_agent()
+    code_skeleton = get_code_skeleton()
+    def requirement_analysis(proplem_statement: str, code_skeleton: str) -> str:
+        prompt = REQUIREMENT_ANALYSIS_PROMPT.format(
+        proplem_statement=proplem_statement,
+        code_skeleton=code_skeleton,
+        task_type="FIX"
+            )
+        messages = [
+            {"role": "system", "content": "You are a expert software requirements analyst. Generate comprehensive, well-structured requirement documents that are immediately actionable for development teams."},
+            {"role": "user", "content": prompt}
+            ]
+        response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME)
+        return response if response else ""
+    requirement = requirement_analysis(problem_statement, code_skeleton)
+    logger.info(f"[REQUIREMENT]\n{requirement}")
+    def architecture_analyzer(problem_statement: str, code_skeleton: str, requirement: str) -> str:
+        prompt = ARCHITECTURE_ANALYSIS_PROMPT.format(
+            problem_statement=problem_statement,
+            code_skeleton=code_skeleton,
+            requirement_document=requirement,
+            task_type="FIX"
+            )
+        messages = [
+        {
+            "role": "system", 
+            "content": "You are a principal software architect. Provide complete technical specifications without omissions or examples."
+        },
+        {
+            "role": "user", 
+            "content": prompt
+        }]
+        response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME,)
+        return response if response else ''
+    architecture = architecture_analyzer(problem_statement=problem_statement, code_skeleton=code_skeleton, requirement=requirement)
+    logger.info(f"[ARCHITECTURE]\n{architecture}")
     
     logger.info(f"Current working directory: {os.getcwd()}")
     
@@ -4055,7 +4101,9 @@ def process_fix_task(input_dict: Dict[str, Any]):
                 run_id_1=RUN_ID,
                 instance_id="",
                 test_runner="pytest",
-                test_runner_mode="FILE"
+                test_runner_mode="FILE",
+                requirement=requirement,
+                architecture=architecture
             )
             return result
         except Exception as fallback_error:
@@ -4063,7 +4111,7 @@ def process_fix_task(input_dict: Dict[str, Any]):
             return ""
 
 def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str, instance_id: str = "", \
-    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
+    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS, requirement: str="", architecture: str="") -> tuple[str, List[str], List[str]]:
     global run_id
     run_id=run_id_1
     cot=EnhancedCOT()
@@ -4088,7 +4136,7 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
     )
     logger.info(f"Starting main agent execution...")
     system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(),format_prompt=FORMAT_PROMPT_V0)
-    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
+    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement, requirement="", architecture="")
     
     start_time = time.time()
     logs: List[str] = []
