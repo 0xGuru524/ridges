@@ -3959,7 +3959,7 @@ def post_process_instruction(instruction: str) -> str:
     processed_instruction = re.sub(pattern, replace_text_block, instruction, flags=re.DOTALL)
     return processed_instruction
 
-def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str, requirement: str, architecture: str) -> str:
+def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
     retry = 0
     code_generation_messages = [
         {
@@ -3968,7 +3968,7 @@ def generate_solution_with_multi_step_reasoning(problem_statement: str, code_ske
         },
         {
             "role": "user",
-            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nRequirement document:\n{requirement}\n\nArchitecture:\n{architecture}\n\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
+            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
         }
     ]
     while retry < 10:
@@ -4005,13 +4005,13 @@ def generate_solution_with_multi_step_reasoning(problem_statement: str, code_ske
     
     return ""
 
-def generate_initial_solution(problem_statement: str, code_skeleton: str, requirement: str, architecture: str) -> str:
+def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
     retry = 0
     while retry < 10:
         try:
             logger.info("Starting multi-step reasoning solution generation")
             
-            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton, requirement, architecture)
+            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton)
             
             if solution:
                 logger.info("Generated initial solution successfully using multi-step reasoning")
@@ -4027,7 +4027,7 @@ def generate_initial_solution(problem_statement: str, code_skeleton: str, requir
                     },
                     {
                         "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nRequirement document:\n{requirement}\n\nArchitecture:\n{architecture}\n\nGenerate the complete and correct implementation in python files."""
+                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nRequirement document:\n\nGenerate the complete and correct implementation in python files."""
                     }
                 ]
                 
@@ -4444,8 +4444,8 @@ def process_create_task(input_dict):
             ]
         response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME)
         return response if response else ""
-    requirement = requirement_analysis(problem_statement, code_skeleton)
-    logger.info(f"[REQUIREMENT]\n{requirement}")
+    #requirement = requirement_analysis(problem_statement, code_skeleton)
+    #logger.info(f"[REQUIREMENT]\n{requirement}")
     def architecture_analyzer(problem_statement: str, code_skeleton: str, requirement: str) -> str:
         prompt = ARCHITECTURE_ANALYSIS_PROMPT.format(
             problem_statement=problem_statement,
@@ -4464,11 +4464,11 @@ def process_create_task(input_dict):
         }]
         response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME,)
         return response if response else ''
-    architecture = architecture_analyzer(problem_statement=problem_statement, code_skeleton=code_skeleton, requirement=requirement)
-    logger.info(f"[ARCHITECTURE]\n{architecture}")
+    #architecture = architecture_analyzer(problem_statement=problem_statement, code_skeleton=code_skeleton, requirement=requirement)
+    #logger.info(f"[ARCHITECTURE]\n{architecture}")
     
     code_skeleton = get_code_skeleton()
-    initial_solution = generate_initial_solution(problem_statement, code_skeleton, requirement, architecture)
+    initial_solution = generate_initial_solution(problem_statement, code_skeleton)
     initial_solution = enhance_solution_with_constants(problem_statement, initial_solution)
     initial_solution = fix_lazy_property_generation(problem_statement, initial_solution)
     initial_solution = fix_recursive_word_definitions(problem_statement, initial_solution)
