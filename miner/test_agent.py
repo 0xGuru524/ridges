@@ -338,6 +338,39 @@ FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
 - Keep generated tests minimal and focused on the bug and its edge cases.
 - Note that current test functions should be passed originally and generated test function is FAIL_TO_PASS.
 
+# 🎯 CoT-Enhanced Coding Assistant with Strategic Controller
+
+## REASONING STRATEGY WITH CoT CONTROLLER
+You are equipped with an advanced CoT Controller that:
+- **Reads your entire thought process** every 5 steps
+- **Validates each reasoning step** against complete history  
+- **Provides strategic guidance** based on pattern analysis
+- **Detects stuck patterns** and suggests course corrections
+
+## OPTIMIZED WORKFLOW WITH CONTROLLER
+1. **Strategic Execution**: Follow guidance from reflection cycles exactly
+2. **Validated Reasoning**: Each step is checked against historical patterns
+3. **Pattern Awareness**: The controller detects and alerts about repetitive or ineffective patterns
+4. **Progress Tracking**: Milestones and progress are continuously monitored
+
+## REFLECTION INTEGRATION
+- When you see "STRATEGIC_REFLECTION:" in thoughts, it contains analyzed guidance
+- "VALIDATION_WARNING:" indicates potential issues with current reasoning direction  
+- Reflection cycles happen every 5 steps automatically
+- Use strategic guidance to maintain optimal trajectory
+
+## CONTROLLER FEATURES UTILIZATION
+- **Reasoning Quality Assessment**: Your reasoning clarity and specificity are measured
+- **Strategic Pattern Detection**: Your approach patterns are analyzed for effectiveness
+- **Progress Timeline**: Your milestone achievements are tracked
+- **Error Pattern Analysis**: Your error responses are analyzed for learning opportunities
+
+## RESPONSE REQUIREMENTS
+- Always consider the complete reasoning history in your planning
+- Pay attention to strategic guidance from reflection cycles
+- Adapt your approach based on validation warnings
+- Maintain coherent reasoning flow between steps
+
 You have access to the following tools:-
 {tools_docs}
 
@@ -961,226 +994,657 @@ class EnhancedCOT:
         text = "\n".join(m["content"] for m in msgs)
         word_count = len(text.split())
         return int(word_count * 0.75)
+
 class CoTController:
     """
-    Controller for managing and optimizing Chain-of-Thought reasoning.
-    Provides strategic guidance, summarization, and next-step planning.
+    Advanced Controller for managing Chain-of-Thought reasoning.
+    Reads entire thought process, validates reasoning, and provides strategic guidance.
     """
     
-    def __init__(self, max_context_actions: int = 30, reflection_interval: int = 5):
-        self.max_context_actions = max_context_actions
+    def __init__(self, reflection_interval: int = 5, reasoning_model: str = QWEN_MODEL_NAME, reflection_model: str = DEEPSEEK_MODEL_NAME):
         self.reflection_interval = reflection_interval
         self.last_reflection_step = 0
         self.strategic_goals = []
-        self.current_focus = ""
+        self.reasoning_validation_history = []
+        self.reasoning_model = reasoning_model
+        self.reflection_model = reflection_model
         
-    def should_reflect(self, current_step: int, cot: EnhancedCOT) -> bool:
-        """Determine if it's time for a reflection cycle."""
-        if current_step - self.last_reflection_step >= self.reflection_interval:
-            return True
-        
-        # Also reflect if we're stuck in repetitive patterns
-        if cot.is_thought_repeated():
-            return True
-            
-        # Reflect if we've made significant progress or hit a roadblock
-        if len(cot.thoughts) > 0:
-            last_action = cot.thoughts[-1]
-            if last_action.is_error or "error" in last_action.observation.lower():
-                return True
-                
-        return False
+    def should_reflect(self, current_step: int) -> bool:
+        """Determine if it's time for a reflection cycle (every N steps)."""
+        return (current_step - self.last_reflection_step) >= self.reflection_interval
     
-    def analyze_cot_state(self, cot: EnhancedCOT) -> Dict[str, Any]:
-        """Analyze the current CoT state and provide insights."""
+    def analyze_entire_thought_process(self, cot: EnhancedCOT) -> Dict[str, Any]:
+        """Comprehensive analysis of the entire CoT history."""
         if not cot.thoughts:
-            return {"status": "initial", "recommendation": "Begin problem analysis"}
+            return self._get_empty_analysis()
         
-        recent_actions = cot.thoughts[-self.max_context_actions:]
+        all_actions = cot.thoughts
         
-        # Analyze patterns
-        tool_patterns = Counter(action.next_tool_name for action in recent_actions if action.next_tool_name)
-        error_patterns = [action for action in recent_actions if action.is_error]
-        success_patterns = [action for action in recent_actions if not action.is_error and action.next_tool_name]
+        # Comprehensive pattern analysis with safe access
+        tool_usage = Counter(action.next_tool_name for action in all_actions if action.next_tool_name)
+        error_actions = [action for action in all_actions if action.is_error]
+        successful_actions = [action for action in all_actions if not action.is_error and action.next_tool_name]
         
+        # Safe extraction of reasoning patterns
+        reasoning_patterns = self._extract_reasoning_patterns(all_actions)
+        progress_timeline = self._build_progress_timeline(all_actions)
+        strategic_shifts = self._detect_strategic_shifts(all_actions)
+        
+        # Ensure all required keys are present
         analysis = {
-            "total_steps": len(cot.thoughts),
-            "recent_tool_patterns": dict(tool_patterns),
-            "error_count": len(error_patterns),
-            "recent_errors": [err.observation for err in error_patterns[-3:]],
-            "current_focus": self._detect_current_focus(recent_actions),
-            "progress_indicators": self._assess_progress(recent_actions),
-            "potential_stuck_patterns": self._detect_stuck_patterns(recent_actions)
+            "total_steps": len(all_actions),
+            "complete_tool_usage": dict(tool_usage),
+            "total_errors": len(error_actions),
+            "error_timeline": [{"step": i, "error": str(getattr(action, 'observation', ''))} 
+                              for i, action in enumerate(all_actions) if getattr(action, 'is_error', False)],
+            "success_rate": len(successful_actions) / len(all_actions) if all_actions else 0,
+            "reasoning_quality": self._assess_reasoning_quality(all_actions),
+            "current_strategic_direction": self._determine_current_strategy(all_actions),
+            "progress_milestones": self._identify_milestones(all_actions),
+            "stuck_indicators": self._detect_deep_stuck_patterns(all_actions),
+            "reasoning_coherence": self._assess_reasoning_coherence(all_actions),
+            "validation_recommendations": self._generate_validation_recommendations(all_actions),
+            "reasoning_patterns": reasoning_patterns,
+            "progress_timeline": progress_timeline,
+            "strategic_shifts": strategic_shifts
         }
         
         return analysis
     
-    def _detect_current_focus(self, recent_actions: List[EnhancedCOT.Action]) -> str:
-        """Detect what the agent is currently focused on."""
-        if not recent_actions:
+    def _get_empty_analysis(self) -> Dict[str, Any]:
+        """Return a safe empty analysis structure."""
+        return {
+            "total_steps": 0,
+            "complete_tool_usage": {},
+            "total_errors": 0,
+            "error_timeline": [],
+            "success_rate": 0,
+            "reasoning_quality": {"score": 0, "feedback": "No reasoning yet", "breakdown": {}},
+            "current_strategic_direction": "Initial analysis",
+            "progress_milestones": [],
+            "stuck_indicators": [],
+            "reasoning_coherence": {"coherent": True, "rationale": "Insufficient data", "issues": []},
+            "validation_recommendations": [],
+            "reasoning_patterns": [],
+            "progress_timeline": [],
+            "strategic_shifts": []
+        }
+    
+    def _extract_reasoning_patterns(self, actions: List[EnhancedCOT.Action]) -> List[str]:
+        """Extract high-level reasoning patterns from thought sequences."""
+        patterns = []
+        thoughts = [getattr(action, 'next_thought', '') for action in actions if hasattr(action, 'next_thought') and action.next_thought]
+        
+        if len(thoughts) < 2:
+            return ["Initial reasoning"]
+            
+        # Analyze reasoning transitions
+        for i in range(1, len(thoughts)):
+            prev_thought = thoughts[i-1].lower() if thoughts[i-1] else ""
+            curr_thought = thoughts[i].lower() if thoughts[i] else ""
+            
+            if "investigat" in prev_thought and "fix" in curr_thought:
+                patterns.append("Investigation-to-Solution transition")
+            elif "error" in prev_thought and "search" in curr_thought:
+                patterns.append("Error-driven investigation")
+            elif "test" in prev_thought and "modify" in curr_thought:
+                patterns.append("Test-driven development")
+            elif "search" in prev_thought and "apply" in curr_thought:
+                patterns.append("Search-and-apply pattern")
+                
+        return patterns if patterns else ["No clear reasoning patterns detected"]
+    
+    def _build_progress_timeline(self, actions: List[EnhancedCOT.Action]) -> List[Dict]:
+        """Build a timeline of significant progress events."""
+        timeline = []
+        
+        for i, action in enumerate(actions):
+            if not hasattr(action, 'next_tool_name') or not hasattr(action, 'is_error'):
+                continue
+                
+            event = None
+            observation_str = str(getattr(action, 'observation', ''))
+            
+            if action.next_tool_name == "run_repo_tests" and not action.is_error:
+                if "passed" in observation_str.lower() or "ok" in observation_str.lower():
+                    event = {"step": i, "type": "test_success", "details": "Tests passing"}
+                elif "failed" in observation_str.lower():
+                    event = {"step": i, "type": "test_failure", "details": "Tests failing"}
+                    
+            elif action.next_tool_name == "apply_code_edit" and not action.is_error:
+                event = {"step": i, "type": "code_change", "details": "Code modification applied"}
+                
+            elif action.next_tool_name and "search" in action.next_tool_name and not action.is_error:
+                if "not found" not in observation_str.lower():
+                    event = {"step": i, "type": "discovery", "details": "Relevant code found"}
+                    
+            elif action.next_tool_name == "get_approval_for_solution":
+                event = {"step": i, "type": "solution_approval", "details": "Solution proposed"}
+                
+            if event:
+                timeline.append(event)
+                
+        return timeline
+    
+    def _detect_strategic_shifts(self, actions: List[EnhancedCOT.Action]) -> List[Dict]:
+        """Detect major strategic shifts in the approach."""
+        shifts = []
+        tool_sequence = [action.next_tool_name for action in actions if hasattr(action, 'next_tool_name') and action.next_tool_name]
+        
+        if len(tool_sequence) < 3:
+            return shifts
+            
+        for i in range(2, len(tool_sequence)):
+            # Detect shift from investigation to implementation
+            if (tool_sequence[i-2] in ["search_in_all_files_content", "search_in_specified_file_v2"] and
+                tool_sequence[i] in ["apply_code_edit", "save_file"]):
+                shifts.append({"step": i, "type": "investigation_to_implementation"})
+                
+            # Detect shift from testing to fixing
+            elif (tool_sequence[i-1] == "run_repo_tests" and
+                  tool_sequence[i] == "apply_code_edit"):
+                shifts.append({"step": i, "type": "test_driven_fix"})
+                
+        return shifts
+    
+    def _assess_reasoning_quality(self, actions: List[EnhancedCOT.Action]) -> Dict[str, Any]:
+        """Assess the quality of the reasoning process."""
+        thoughts = [action.next_thought for action in actions if hasattr(action, 'next_thought') and action.next_thought]
+        
+        if not thoughts:
+            return {"score": 0, "feedback": "No reasoning yet", "breakdown": {}}
+            
+        quality_indicators = {
+            "clarity": 0,
+            "specificity": 0, 
+            "action_orientation": 0,
+            "learning_from_errors": 0
+        }
+        
+        # Analyze thought quality
+        for thought in thoughts:
+            thought_lower = thought.lower() if thought else ""
+            
+            if any(indicator in thought_lower for indicator in ["because", "therefore", "since"]):
+                quality_indicators["clarity"] += 1
+                
+            if any(indicator in thought_lower for indicator in ["specific", "exactly", "precisely"]):
+                quality_indicators["specificity"] += 1
+                
+            if any(indicator in thought_lower for indicator in ["will", "should", "next", "try"]):
+                quality_indicators["action_orientation"] += 1
+                
+            if "error" in thought_lower and ("learn" in thought_lower or "understand" in thought_lower):
+                quality_indicators["learning_from_errors"] += 1
+        
+        # Normalize scores
+        max_possible = len(thoughts)
+        for key in quality_indicators:
+            quality_indicators[key] = min(quality_indicators[key] / max_possible, 1.0) if max_possible > 0 else 0
+            
+        overall_score = sum(quality_indicators.values()) / len(quality_indicators) if quality_indicators else 0
+        
+        return {
+            "score": overall_score,
+            "breakdown": quality_indicators,
+            "feedback": self._generate_quality_feedback(overall_score, quality_indicators)
+        }
+    
+    def _determine_current_strategy(self, actions: List[EnhancedCOT.Action]) -> str:
+        """Determine the current high-level strategy being employed."""
+        if not actions:
             return "Initial analysis"
             
-        # Analyze tool usage patterns
-        tool_sequence = [action.next_tool_name for action in recent_actions if action.next_tool_name]
+        recent_actions = actions[-5:]  # Last 5 actions
+        tool_pattern = [action.next_tool_name for action in recent_actions if hasattr(action, 'next_tool_name') and action.next_tool_name]
+        thought_pattern = [action.next_thought for action in recent_actions if hasattr(action, 'next_thought') and action.next_thought]
         
-        if not tool_sequence:
-            return "Planning phase"
+        # Analyze strategic focus
+        if any("search" in str(tool) for tool in tool_pattern):
+            return "Comprehensive code investigation"
+        elif any("test" in str(tool) for tool in tool_pattern):
+            return "Validation and testing focus"
+        elif any("apply_code_edit" in str(tool) for tool in tool_pattern):
+            return "Active implementation"
+        elif any("approval" in str(tool) for tool in tool_pattern):
+            return "Solution evaluation and approval"
+        elif any("start_over" in str(tool) for tool in tool_pattern):
+            return "Strategic reset"
             
-        last_tools = tool_sequence[-3:]  # Look at last 3 tools
-        
-        # Detect focus based on tool patterns
-        if any(tool in last_tools for tool in ["search_in_all_files_content", "search_in_specified_file_v2"]):
-            return "Code investigation"
-        elif any(tool in last_tools for tool in ["run_repo_tests", "run_code"]):
-            return "Testing and validation"
-        elif any(tool in last_tools for tool in ["apply_code_edit", "save_file"]):
-            return "Implementation"
-        elif "get_approval_for_solution" in last_tools:
-            return "Solution approval"
-        elif "generate_test_function" in last_tools:
-            return "Test generation"
+        # Fallback to thought analysis
+        recent_thoughts_text = " ".join([t for t in thought_pattern if t]).lower()
+        if any(term in recent_thoughts_text for term in ["understand", "analyze", "investigate"]):
+            return "Problem understanding"
+        elif any(term in recent_thoughts_text for term in ["fix", "solve", "implement"]):
+            return "Solution implementation"
+        elif any(term in recent_thoughts_text for term in ["test", "validate", "verify"]):
+            return "Solution validation"
             
         return "General problem solving"
     
-    def _assess_progress(self, recent_actions: List[EnhancedCOT.Action]) -> List[str]:
-        """Assess what progress has been made."""
-        progress = []
+    def _identify_milestones(self, actions: List[EnhancedCOT.Action]) -> List[str]:
+        """Identify significant milestones achieved."""
+        milestones = []
         
-        # Look for successful test runs
-        test_successes = [action for action in recent_actions 
-                         if action.next_tool_name == "run_repo_tests" 
-                         and not action.is_error 
-                         and "failed" not in str(action.observation).lower()]
+        # Check for test success milestones
+        test_successes = [action for action in actions 
+                         if hasattr(action, 'next_tool_name') and action.next_tool_name == "run_repo_tests" 
+                         and hasattr(action, 'is_error') and not action.is_error 
+                         and "failed" not in str(getattr(action, 'observation', '')).lower()]
         if test_successes:
-            progress.append("Tests passing")
+            milestones.append("Achieved test pass status")
             
-        # Look for successful code edits
-        successful_edits = [action for action in recent_actions 
-                           if action.next_tool_name == "apply_code_edit" 
-                           and not action.is_error]
+        # Check for successful code modifications
+        successful_edits = [action for action in actions 
+                           if hasattr(action, 'next_tool_name') and action.next_tool_name == "apply_code_edit" 
+                           and hasattr(action, 'is_error') and not action.is_error]
         if successful_edits:
-            progress.append("Code modifications applied")
+            milestones.append("Successfully modified code")
             
-        # Look for investigation findings
-        search_actions = [action for action in recent_actions 
-                         if "search" in action.next_tool_name 
-                         and not action.is_error 
-                         and "not found" not in str(action.observation).lower()]
-        if search_actions:
-            progress.append("Relevant code locations identified")
+        # Check for solution approval
+        approval_actions = [action for action in actions 
+                           if hasattr(action, 'next_tool_name') and action.next_tool_name == "get_approval_for_solution"]
+        if approval_actions:
+            milestones.append("Solution proposed for approval")
             
-        return progress
+        # Check for error resolution
+        recent_errors = [action for action in actions[-10:] if hasattr(action, 'is_error') and action.is_error]
+        if not recent_errors and len(actions) > 10:
+            milestones.append("Resolved recent error patterns")
+            
+        return milestones
     
-    def _detect_stuck_patterns(self, recent_actions: List[EnhancedCOT.Action]) -> List[str]:
-        """Detect patterns indicating the agent might be stuck."""
+    def _detect_deep_stuck_patterns(self, actions: List[EnhancedCOT.Action]) -> List[Dict]:
+        """Detect complex stuck patterns that require intervention."""
         stuck_patterns = []
         
-        # Repeated tool calls with same arguments
-        if len(recent_actions) >= 2:
-            for i in range(1, len(recent_actions)):
-                if (recent_actions[i].next_tool_name == recent_actions[i-1].next_tool_name and
-                    recent_actions[i].next_tool_args == recent_actions[i-1].next_tool_args):
-                    stuck_patterns.append(f"Repeated {recent_actions[i].next_tool_name} calls")
-                    break
-        
-        # Many consecutive errors
-        consecutive_errors = 0
-        for action in reversed(recent_actions):
-            if action.is_error:
-                consecutive_errors += 1
-            else:
-                break
-        if consecutive_errors >= 3:
-            stuck_patterns.append(f"{consecutive_errors} consecutive errors")
+        if len(actions) < 8:
+            return stuck_patterns
             
-        # Looping between tools without progress
-        if len(recent_actions) >= 4:
-            tool_sequence = [action.next_tool_name for action in recent_actions[-4:] if action.next_tool_name]
-            if len(tool_sequence) == 4 and len(set(tool_sequence)) <= 2:
-                stuck_patterns.append("Cycling between limited tools")
+        # Analyze last 10 actions for stuck patterns
+        recent_actions = actions[-10:]
+        
+        # Pattern 1: Repeated error cycles
+        error_cycles = []
+        current_error_streak = 0
+        for action in recent_actions:
+            if hasattr(action, 'is_error') and action.is_error:
+                current_error_streak += 1
+            else:
+                if current_error_streak >= 2:
+                    error_cycles.append(current_error_streak)
+                current_error_streak = 0
+        if current_error_streak >= 2:
+            error_cycles.append(current_error_streak)
+            
+        if error_cycles:
+            stuck_patterns.append({
+                "type": "repeated_error_cycles",
+                "details": f"Error streaks: {error_cycles}",
+                "severity": "high" if max(error_cycles) >= 3 else "medium"
+            })
+        
+        # Pattern 2: Tool usage stagnation
+        tool_sequence = [action.next_tool_name for action in recent_actions if hasattr(action, 'next_tool_name') and action.next_tool_name]
+        if len(set(tool_sequence)) <= 2 and len(tool_sequence) >= 6:
+            stuck_patterns.append({
+                "type": "tool_stagnation", 
+                "details": f"Limited to tools: {list(set(tool_sequence))}",
+                "severity": "medium"
+            })
+            
+        # Pattern 3: No progress on core issue
+        core_issue_mentions = 0
+        for action in recent_actions:
+            if hasattr(action, 'next_thought') and action.next_thought and any(term in action.next_thought.lower() for term in ["main issue", "root cause", "core problem"]):
+                core_issue_mentions += 1
                 
+        if core_issue_mentions >= 3:
+            # Check if we're still mentioning the same issue without resolution
+            stuck_patterns.append({
+                "type": "core_issue_stagnation",
+                "details": "Repeated mentions of core issue without resolution",
+                "severity": "high"
+            })
+            
         return stuck_patterns
     
-    def generate_reflection_prompt(self, cot: EnhancedCOT, problem_statement: str) -> str:
-        """Generate a reflection prompt for the LLM based on current CoT state."""
-        analysis = self.analyze_cot_state(cot)
+    def _assess_reasoning_coherence(self, actions: List[EnhancedCOT.Action]) -> Dict[str, Any]:
+        """Assess how coherent and logical the reasoning sequence is."""
+        thoughts = [action.next_thought for action in actions if hasattr(action, 'next_thought') and action.next_thought]
+        
+        if len(thoughts) < 3:
+            return {"coherent": True, "rationale": "Insufficient data", "issues": []}
+            
+        coherence_issues = []
+        
+        # Check for logical consistency in reasoning
+        for i in range(1, len(thoughts)):
+            prev_thought = thoughts[i-1].lower() if thoughts[i-1] else ""
+            curr_thought = thoughts[i].lower() if thoughts[i] else ""
+            
+            # Detect reasoning gaps
+            if ("should" in prev_thought or "will" in prev_thought) and "but" in curr_thought:
+                coherence_issues.append(f"Contradiction at step {i}")
+                
+            # Detect abandoned reasoning threads
+            if "investigate" in prev_thought and "investigate" not in curr_thought and i < len(thoughts) - 2:
+                # Check if investigation was completed
+                next_thoughts = " ".join([t for t in thoughts[i:i+2] if t]).lower()
+                if "found" not in next_thoughts and "result" not in next_thoughts:
+                    coherence_issues.append(f"Abandoned investigation at step {i}")
+                    
+        return {
+            "coherent": len(coherence_issues) == 0,
+            "issues": coherence_issues,
+            "rationale": "Reasoning shows logical flow" if not coherence_issues else f"Issues: {', '.join(coherence_issues)}"
+        }
+    
+    def _generate_validation_recommendations(self, actions: List[EnhancedCOT.Action]) -> List[str]:
+        """Generate specific recommendations for validating current approach."""
+        recommendations = []
+        
+        # Check if we need to validate assumptions
+        assumption_keywords = ["assume", "believe", "think", "probably", "likely"]
+        assumption_mentions = sum(1 for action in actions[-5:] 
+                                if hasattr(action, 'next_thought') and action.next_thought and 
+                                any(keyword in action.next_thought.lower() for keyword in assumption_keywords))
+        
+        if assumption_mentions >= 2:
+            recommendations.append("Validate key assumptions with concrete testing")
+            
+        # Check for solution confidence
+        confidence_indicators = ["sure", "confident", "certain", "definitely"]
+        confidence_mentions = sum(1 for action in actions[-5:] 
+                                if hasattr(action, 'next_thought') and action.next_thought and 
+                                any(indicator in action.next_thought.lower() for indicator in confidence_indicators))
+        
+        if confidence_mentions >= 3:
+            recommendations.append("Verify solution confidence with additional test cases")
+            
+        # Check for comprehensive testing
+        test_actions = [action for action in actions if hasattr(action, 'next_tool_name') and action.next_tool_name == "run_repo_tests"]
+        if len(test_actions) < 2:
+            recommendations.append("Increase test coverage to validate approach")
+            
+        return recommendations
+    
+    def _generate_quality_feedback(self, overall_score: float, breakdown: Dict) -> str:
+        """Generate feedback based on reasoning quality assessment."""
+        if overall_score > 0.8:
+            return "Excellent reasoning quality - clear, specific, and action-oriented"
+        elif overall_score > 0.6:
+            return "Good reasoning quality - consider being more specific in analysis"
+        elif overall_score > 0.4:
+            return "Moderate reasoning quality - focus on clearer causal reasoning"
+        else:
+            return "Needs improvement - work on specific, actionable reasoning steps"
+    
+    def validate_current_reasoning(self, cot: EnhancedCOT, current_thought: str, current_tool: str, current_args: Dict) -> Dict[str, Any]:
+        """Validate if the current reasoning direction is correct based on entire history."""
+        analysis = self.analyze_entire_thought_process(cot)
+        
+        validation = {
+            "is_valid": True,
+            "confidence": "high",
+            "recommendations": [],
+            "warnings": [],
+            "strategic_alignment": self._check_strategic_alignment(cot, current_thought, current_tool, analysis)
+        }
+        
+        # Check for repetitive patterns
+        if self._is_repetitive_action(cot, current_tool, current_args):
+            validation["warnings"].append("This action appears repetitive based on history")
+            validation["is_valid"] = False
+            
+        # Check if this addresses core issues
+        if not self._addresses_core_issues(cot, current_thought):
+            validation["warnings"].append("Current thought may not address the main problem")
+            validation["confidence"] = "medium"
+            
+        # Check strategic alignment with milestones
+        strategic_fit = self._assess_strategic_fit(cot, current_tool, analysis)
+        if not strategic_fit["aligned"]:
+            validation["warnings"].append(f"Action may not align with current strategy: {strategic_fit['reason']}")
+            validation["confidence"] = "medium"
+            
+        # Generate recommendations based on analysis
+        validation["recommendations"] = analysis.get("validation_recommendations", [])
+        
+        return validation
+    
+    def _is_repetitive_action(self, cot: EnhancedCOT, current_tool: str, current_args: Dict) -> bool:
+        """Check if current action is repetitive based on history."""
+        if not cot.thoughts:
+            return False
+            
+        # Check last 5 actions for repetition
+        recent_actions = cot.thoughts[-5:]
+        similar_actions = 0
+        
+        for action in recent_actions:
+            if (hasattr(action, 'next_tool_name') and action.next_tool_name == current_tool and 
+                hasattr(action, 'next_tool_args') and action.next_tool_args == current_args):
+                similar_actions += 1
+                
+        return similar_actions >= 2
+    
+    def _addresses_core_issues(self, cot: EnhancedCOT, current_thought: str) -> bool:
+        """Check if current thought addresses identified core issues."""
+        if not cot.thoughts:
+            return True
+            
+        # Extract potential core issues from error patterns
+        error_patterns = []
+        for action in cot.thoughts:
+            if hasattr(action, 'is_error') and action.is_error and hasattr(action, 'observation'):
+                error_text = str(action.observation)
+                if "error" in error_text.lower():
+                    error_patterns.append(error_text)
+                
+        if not error_patterns:
+            return True
+            
+        # Check if current thought addresses any error patterns
+        thought_lower = current_thought.lower() if current_thought else ""
+        for error in error_patterns[-3:]:  # Check last 3 errors
+            error_keywords = self._extract_keywords(error)
+            if any(keyword in thought_lower for keyword in error_keywords):
+                return True
+                
+        return False
+    
+    def _extract_keywords(self, text: str) -> List[str]:
+        """Extract relevant keywords from text."""
+        # Simple keyword extraction - can be enhanced
+        words = text.lower().split()
+        # Filter common words and keep relevant terms
+        stop_words = ["the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "but"]
+        keywords = [word for word in words if word not in stop_words and len(word) > 3]
+        return list(set(keywords))
+    
+    def _check_strategic_alignment(self, cot: EnhancedCOT, current_thought: str, current_tool: str, analysis: Dict) -> str:
+        """Check if current action aligns with strategic direction."""
+        current_strategy = analysis.get("current_strategic_direction", "")
+        milestones = analysis.get("progress_milestones", [])
+        
+        if "investigation" in current_strategy and current_tool in ["apply_code_edit", "save_file"]:
+            return "Premature implementation - consider more investigation"
+        elif "implementation" in current_strategy and "search" in current_tool:
+            return "Distracted from implementation"
+        elif "validation" in current_strategy and current_tool not in ["run_repo_tests", "run_code"]:
+            return "Not focused on validation"
+            
+        return "Well aligned with current strategy"
+    
+    def _assess_strategic_fit(self, cot: EnhancedCOT, current_tool: str, analysis: Dict) -> Dict[str, Any]:
+        """Assess how well the current action fits the overall strategy."""
+        stuck_patterns = analysis.get("stuck_indicators", [])
+        timeline = analysis.get("progress_timeline", [])
+        
+        # If stuck on errors, validate that we're not repeating the same approach
+        high_severity_stuck = any(pattern.get("severity") == "high" for pattern in stuck_patterns)
+        if high_severity_stuck and current_tool in ["run_repo_tests", "apply_code_edit"]:
+            return {"aligned": False, "reason": "Repeating approach that led to stuck state"}
+            
+        # Check if we're making progressive moves
+        recent_progress = any(event["step"] >= len(cot.thoughts) - 3 for event in timeline)
+        if not recent_progress and current_tool in ["search_in_all_files_content", "get_file_content"]:
+            return {"aligned": False, "reason": "Excessive investigation without recent progress"}
+            
+        return {"aligned": True, "reason": "Action supports strategic progression"}
+    
+    def generate_comprehensive_reflection(self, cot: EnhancedCOT, problem_statement: str, current_step: int) -> str:
+        """Generate comprehensive reflection prompt analyzing entire thought process."""
+        analysis = self.analyze_entire_thought_process(cot)
+        reasoning_quality = analysis["reasoning_quality"]
+        
+        # Safe access to all analysis fields with defaults
+        progress_timeline = analysis.get("progress_timeline", [])
+        progress_milestones = analysis.get("progress_milestones", [])
+        complete_tool_usage = analysis.get("complete_tool_usage", {})
+        reasoning_patterns = analysis.get("reasoning_patterns", [])
+        error_timeline = analysis.get("error_timeline", [])
+        stuck_indicators = analysis.get("stuck_indicators", [])
+        validation_recommendations = analysis.get("validation_recommendations", [])
+        reasoning_coherence = analysis.get("reasoning_coherence", {})
+        current_strategic_direction = analysis.get("current_strategic_direction", "Unknown")
         
         reflection_prompt = f"""
-# COT CONTROLLER REFLECTION CYCLE
+# COT CONTROLLER - COMPREHENSIVE REFLECTION CYCLE (Step {current_step})
 
-## CURRENT STATUS ANALYSIS:
-- Total steps taken: {analysis['total_steps']}
-- Current focus: {analysis['current_focus']}
-- Recent tool patterns: {analysis['recent_tool_patterns']}
-- Progress made: {', '.join(analysis['progress_indicators']) if analysis['progress_indicators'] else 'None yet'}
-- Potential issues: {', '.join(analysis['potential_stuck_patterns']) if analysis['potential_stuck_patterns'] else 'None detected'}
+## COMPLETE REASONING ANALYSIS:
+- **Total Steps**: {analysis.get('total_steps', 0)}
+- **Reasoning Quality Score**: {reasoning_quality.get('score', 0):.2f}/1.0
+- **Reasoning Feedback**: {reasoning_quality.get('feedback', 'No feedback available')}
+- **Strategic Direction**: {current_strategic_direction}
+- **Coherence Assessment**: {reasoning_coherence.get('rationale', 'Unknown')}
 
-## RECENT ERRORS (last 3):
-{chr(10).join(f"- {error}" for error in analysis['recent_errors']) if analysis['recent_errors'] else "No recent errors"}
+## PROGRESS ASSESSMENT:
+**Milestones Achieved**:
+{chr(10).join(f"  ✓ {milestone}" for milestone in progress_milestones) if progress_milestones else "  ⚠ No significant milestones yet"}
 
-## PROBLEM STATEMENT:
+**Progress Timeline** (Key Events):
+{chr(10).join(f"  • Step {event['step']+1}: {event['type']} - {event['details']}" for event in progress_timeline[-5:]) if progress_timeline else "  ⚠ Limited progress events"}
+
+## STRATEGIC PATTERNS:
+**Tool Usage Distribution**:
+{chr(10).join(f"  - {tool}: {count} times" for tool, count in complete_tool_usage.items()) if complete_tool_usage else "  ⚠ No tool usage data"}
+
+**Reasoning Patterns Detected**:
+{chr(10).join(f"  • {pattern}" for pattern in reasoning_patterns) if reasoning_patterns else "  ⚠ No clear patterns detected"}
+
+## ISSUES AND RISKS:
+**Error Analysis** ({len(error_timeline)} total errors):
+{chr(10).join(f"  ⚠ Step {error['step']+1}: {error['error'][:100]}..." for error in error_timeline[-3:]) if error_timeline else "  ✅ No recent errors"}
+
+**Stuck Pattern Detection**:
+{chr(10).join(f"  🚨 {pattern['type']}: {pattern['details']} (Severity: {pattern['severity']})" for pattern in stuck_indicators) if stuck_indicators else "  ✅ No major stuck patterns"}
+
+## PROBLEM CONTEXT:
 {problem_statement}
 
-## REFLECTION QUESTIONS:
-1. Based on the progress so far, what is the most critical next step?
-2. Are there any patterns in the recent errors that suggest a different approach?
-3. What evidence do we have that we're moving in the right direction?
-4. Are there any assumptions we should verify or alternative approaches to consider?
-5. What specific, actionable step should we take next and why?
+## CRITICAL REFLECTION QUESTIONS:
 
-## INSTRUCTIONS:
-Provide a concise reflection that summarizes:
-- What we've accomplished so far
-- What we've learned from successes and failures  
-- The most promising direction forward
-- The exact next action to take
+1. **Strategic Alignment**: Is our current approach effectively addressing the core problem? What evidence supports this?
 
-End with a clear "NEXT STEP SUMMARY" that specifies the immediate next task.
+2. **Learning from History**: What have we learned from both successes and failures in the past {analysis.get('total_steps', 0)} steps?
+
+3. **Efficiency Assessment**: Are we making optimal use of our steps, or are there redundant or ineffective patterns?
+
+4. **Risk Evaluation**: What are the biggest risks to solving this problem based on our current trajectory?
+
+5. **Course Correction**: If we continue exactly as we are, what is the likely outcome? What specific change would maximize success probability?
+
+## VALIDATION REQUIREMENTS:
+{chr(10).join(f"  • {rec}" for rec in validation_recommendations) if validation_recommendations else "  • Continue with current validation approach"}
+
+## NEXT STRATEGIC DIRECTION:
+Provide a clear, actionable strategic plan for the next phase. Be specific about:
+- The single most important objective for the next 5 steps
+- What to continue doing (what's working)
+- What to stop doing (what's not working)  
+- What to start doing (missing elements)
+- Specific validation criteria for the next phase
+
+End with a precise **NEXT PHASE STRATEGY** section.
 """
 
         return reflection_prompt
     
-    def extract_next_step_summary(self, reflection_response: str) -> str:
-        """Extract the next step summary from the reflection response."""
+    def extract_strategic_guidance(self, reflection_response: str) -> Dict[str, Any]:
+        """Extract structured strategic guidance from reflection response."""
         lines = reflection_response.split('\n')
-        next_step_lines = []
-        in_next_step = False
+        
+        guidance = {
+            "next_phase_objective": "",
+            "continue_actions": [],
+            "stop_actions": [], 
+            "start_actions": [],
+            "validation_criteria": [],
+            "overall_strategy": ""
+        }
+        
+        current_section = None
         
         for line in lines:
-            if "NEXT STEP SUMMARY" in line.upper():
-                in_next_step = True
+            line = line.strip()
+            
+            if "NEXT PHASE STRATEGY" in line.upper():
+                current_section = "strategy"
                 continue
-            if in_next_step and line.strip() and not line.strip().startswith('#'):
-                next_step_lines.append(line.strip())
-            elif in_next_step and not line.strip():
-                break
+            elif "CONTINUE" in line.upper() and "DOING" in line.upper():
+                current_section = "continue"
+                continue
+            elif "STOP" in line.upper() and "DOING" in line.upper():
+                current_section = "stop" 
+                continue
+            elif "START" in line.upper() and "DOING" in line.upper():
+                current_section = "start"
+                continue
+            elif "VALIDATION" in line.upper() and "CRITERIA" in line.upper():
+                current_section = "validation"
+                continue
+            elif "OBJECTIVE" in line.upper():
+                current_section = "objective"
+                continue
                 
-        if next_step_lines:
-            return ' '.join(next_step_lines)
+            if current_section and line and not line.startswith('#') and not line.startswith('-'):
+                if current_section == "strategy":
+                    guidance["overall_strategy"] += " " + line
+                elif current_section == "objective":
+                    guidance["next_phase_objective"] += " " + line
+                elif current_section == "continue" and line.startswith('-'):
+                    guidance["continue_actions"].append(line[1:].strip())
+                elif current_section == "stop" and line.startswith('-'):
+                    guidance["stop_actions"].append(line[1:].strip())
+                elif current_section == "start" and line.startswith('-'):
+                    guidance["start_actions"].append(line[1:].strip())
+                elif current_section == "validation" and line.startswith('-'):
+                    guidance["validation_criteria"].append(line[1:].strip())
         
-        # Fallback: try to find the last actionable sentence
-        sentences = reflection_response.split('.')
-        for sentence in reversed(sentences):
-            if any(keyword in sentence.lower() for keyword in ['next', 'should', 'will', 'need to', 'must']):
-                return sentence.strip() + '.'
-                
-        return "Continue with current approach"
+        # Clean up
+        guidance["overall_strategy"] = guidance["overall_strategy"].strip()
+        guidance["next_phase_objective"] = guidance["next_phase_objective"].strip()
+        
+        return guidance
     
-    def update_strategic_goals(self, reflection_response: str, current_step: int):
-        """Update strategic goals based on reflection."""
+    def update_controller_state(self, reflection_response: str, current_step: int):
+        """Update controller state based on reflection."""
         self.last_reflection_step = current_step
+        guidance = self.extract_strategic_guidance(reflection_response)
         
-        # Extract key insights for future reference
-        lines = reflection_response.split('\n')
-        key_insights = []
+        # Store strategic guidance for future reference
+        self.strategic_goals.append({
+            "step": current_step,
+            "objective": guidance["next_phase_objective"],
+            "strategy": guidance["overall_strategy"]
+        })
         
-        for line in lines:
-            line_lower = line.lower()
-            if any(term in line_lower for term in ['learned', 'discovered', 'found that', 'key insight']):
-                key_insights.append(line.strip())
-        
-        if key_insights:
-            self.strategic_goals.extend(key_insights[-3:])  # Keep last 3 insights
+        # Keep only last 5 strategic goals
+        if len(self.strategic_goals) > 5:
+            self.strategic_goals = self.strategic_goals[-5:]
+            
 class Utils:
     @classmethod
     def get_available_modules(cls) -> set[str]:
@@ -4429,40 +4893,29 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
     logger.info(f"Final Patch Generated..: Length: {len(patch)}")
 
     return patch
+
 def my_fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str, instance_id: str = "", \
     test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
     global run_id
-    run_id=run_id_1
-    cot=EnhancedCOT()
+    run_id = run_id_1
+    cot = EnhancedCOT()
     
-    # Initialize CoT Controller
-    cot_controller = CoTController(
-        max_context_actions=30,
-        reflection_interval=5  # Reflect every 5 steps
-    )
+    # Initialize Enhanced CoT Controller - reads entire thoughts every 5 steps
+    cot_controller = CoTController(reflection_interval=5)
     
-    tool_manager=FixTaskEnhancedToolManager(
+    tool_manager = FixTaskEnhancedToolManager(
         available_tools=[
-            "get_file_content",
-            "save_file", 
-            "get_approval_for_solution",
-            "get_functions",
-            "get_classes",
-            "search_in_all_files_content",
-            "search_in_specified_file_v2",
-            "start_over",
-            "run_repo_tests",
-            "run_code",
-            "apply_code_edit",
-            "generate_test_function",
-            "finish"
+            "get_file_content", "save_file", "get_approval_for_solution",
+            "get_functions", "get_classes", "search_in_all_files_content",
+            "search_in_specified_file_v2", "start_over", "run_repo_tests",
+            "run_code", "apply_code_edit", "generate_test_function", "finish"
         ],
         test_runner=test_runner,
         test_runner_mode=test_runner_mode
     )
     
-    logger.info(f"Starting main agent execution with CoT Controller...")
-    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(),format_prompt=FORMAT_PROMPT_V0)
+    logger.info(f"Starting main agent execution with Enhanced CoT Controller...")
+    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(), format_prompt=FORMAT_PROMPT_V0)
     instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
     
     start_time = time.time()
@@ -4474,44 +4927,73 @@ def my_fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1
         logger.info(f"Execution step {step + 1}/{n_max_steps}")
         
         if time.time() - start_time > timeout:
-            cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True,inference_error_counter={},request_data=[]))
+            cot.add_action(EnhancedCOT.Action(
+                next_thought="global timeout reached", 
+                next_tool_name="", 
+                next_tool_args={}, 
+                observation="", 
+                is_error=True, 
+                inference_error_counter={}, 
+                request_data=[]
+            ))
             break
 
-        # COT CONTROLLER: Check if we should reflect
-        if cot_controller.should_reflect(step, cot):
-            logger.info(f"[COT_CONTROLLER] Reflection cycle triggered at step {step}")
+        # COT CONTROLLER: Comprehensive reflection every 5 steps
+        if cot_controller.should_reflect(step):
+            logger.info(f"[COT_CONTROLLER] Comprehensive reflection triggered at step {step}")
             
-            reflection_prompt = cot_controller.generate_reflection_prompt(cot, problem_statement)
+            reflection_prompt = cot_controller.generate_comprehensive_reflection(cot, problem_statement, step)
             
             reflection_messages = [
-                {"role": "system", "content": "You are a strategic reasoning coordinator. Analyze the current progress and provide clear guidance for the next steps."},
-                {"role": "user", "content": reflection_prompt}
+                {
+                    "role": "system", 
+                    "content": "You are a strategic reasoning analyst. Comprehensively analyze the entire reasoning process and provide detailed strategic guidance."
+                },
+                {
+                    "role": "user", 
+                    "content": reflection_prompt
+                }
             ]
             
             try:
                 reflection_response = EnhancedNetwork.make_request(reflection_messages, model=GLM_MODEL_NAME)
-                next_step_summary = cot_controller.extract_next_step_summary(reflection_response)
-                cot_controller.update_strategic_goals(reflection_response, step)
+                strategic_guidance = cot_controller.extract_strategic_guidance(reflection_response)
+                cot_controller.update_controller_state(reflection_response, step)
                 
-                logger.info(f"[COT_CONTROLLER] Next step summary: {next_step_summary}")
+                logger.info(f"[COT_CONTROLLER] Next phase objective: {strategic_guidance['next_phase_objective']}")
                 
-                # Add the reflection as a special thought
+                # Add comprehensive reflection to CoT
                 cot.add_action(EnhancedCOT.Action(
-                    next_thought=f"REFLECTION: {next_step_summary}",
+                    next_thought=f"STRATEGIC_REFLECTION: {strategic_guidance['overall_strategy']}",
                     next_tool_name="",
                     next_tool_args={},
-                    observation="Reflection cycle completed",
+                    observation=f"Reflection completed. Next objective: {strategic_guidance['next_phase_objective']}",
                     is_error=False,
-                    raw_response=reflection_response
+                    raw_response=reflection_response,
+                    total_attempts=0,
+                    inference_error_counter={},
+                    request_data=reflection_messages
                 ))
                 
             except Exception as e:
-                logger.error(f"[COT_CONTROLLER] Reflection failed: {e}")
-        
+                logger.error(f"[COT_CONTROLLER] Comprehensive reflection failed: {e}")
+                # Add reflection failure to CoT
+                cot.add_action(EnhancedCOT.Action(
+                    next_thought="Reflection cycle failed due to error",
+                    next_tool_name="",
+                    next_tool_args={},
+                    observation=f"Reflection error: {str(e)}",
+                    is_error=True,
+                    raw_response="",
+                    total_attempts=0,
+                    inference_error_counter={},
+                    request_data=[]
+                ))
+
         messages: List[Dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": instance_prompt},
-            ]
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": instance_prompt},
+        ]
         
         messages.extend(cot.to_str())
 
@@ -4523,50 +5005,127 @@ def my_fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1
             messages.append({"role": "user", "content": DO_NOT_REPEAT_TOOL_CALLS.format(previous_response=f"next_tool_name:{last_thought.next_tool_name}\n next_tool_args:{last_thought.next_tool_args}")})
     
         try:
-            next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages = EnhancedNetwork.inference(messages, model=GLM_MODEL_NAME, run_id=run_id)
+            next_thought, next_tool_name, next_tool_args, raw_text, total_attempts, error_counter, messages = EnhancedNetwork.inference(messages, model=GLM_MODEL_NAME, run_id=run_id)
         except Exception as e:
             import traceback
-            error_msg=f"\n\nERROR: {repr(e)} {traceback.format_exc()}"
+            error_msg = f"\n\nERROR: {repr(e)} {traceback.format_exc()}"
             logger.error(f"Inference error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=error_msg,next_tool_name="",next_tool_args={},observation="",is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            cot.add_action(EnhancedCOT.Action(
+                next_thought=error_msg,
+                next_tool_name="",
+                next_tool_args={},
+                observation="",
+                is_error=True,
+                raw_response=raw_text,
+                total_attempts=total_attempts,
+                inference_error_counter=error_counter,
+                request_data=messages
+            ))
             break
         
         logger.info(f"About to execute operation: {next_tool_name}")
        
+        # COT CONTROLLER: Validate current reasoning before execution
+        reasoning_validation = cot_controller.validate_current_reasoning(cot, next_thought, next_tool_name, next_tool_args)
+        
+        if not reasoning_validation["is_valid"] or reasoning_validation["confidence"] == "low":
+            logger.warning(f"[COT_CONTROLLER] Reasoning validation issues: {reasoning_validation['warnings']}")
+            
+            # Add validation warning to CoT
+            cot.add_action(EnhancedCOT.Action(
+                next_thought=f"VALIDATION_WARNING: {'; '.join(reasoning_validation['warnings'])}",
+                next_tool_name="",
+                next_tool_args={},
+                observation="Reasoning validation flagged potential issues",
+                is_error=False,
+                raw_response="",
+                total_attempts=0,
+                inference_error_counter={},
+                request_data=[]
+            ))
+            
+            # Optionally: Skip execution or proceed with caution
+            # For now, we'll proceed but log the warning
+
         try:
             logger.info(f"next_thought: {next_thought}\nnext_tool_name: {next_tool_name}\nnext_tool_args: {next_tool_args}\n")
+            
+            # Clean tool name if needed
             if '"' in next_tool_name or "'" in next_tool_name:
-                next_tool_name=next_tool_name.replace('"','')
-                next_tool_name=next_tool_name.replace("'","")
+                next_tool_name = next_tool_name.replace('"', '').replace("'", "")
                 
             next_observation = tool_manager.get_tool(next_tool_name)(**next_tool_args) if next_tool_args else tool_manager.get_tool(next_tool_name)()
+            
             logger.info(f"next_observation: {next_observation}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=next_observation,is_error=False,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            
+            cot.add_action(EnhancedCOT.Action(
+                next_thought=next_thought,
+                next_tool_name=next_tool_name, 
+                next_tool_args=next_tool_args,
+                observation=next_observation,
+                is_error=False,
+                raw_response=raw_text,
+                total_attempts=total_attempts,
+                inference_error_counter=error_counter,
+                request_data=messages
+            ))
+            
         except EnhancedToolManager.Error as e:
             import traceback
-            error_msg=f"observation: {e.message}"
+            error_msg = f"observation: {e.message}"
             logger.error(f"Tool error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            cot.add_action(EnhancedCOT.Action(
+                next_thought=next_thought,
+                next_tool_name=next_tool_name,
+                next_tool_args=next_tool_args,
+                observation=error_msg,
+                is_error=True,
+                raw_response=raw_text,
+                total_attempts=total_attempts,
+                inference_error_counter=error_counter,
+                request_data=messages
+            ))
             continue
         except Exception as e:
             import traceback
-            error_traceback=traceback.format_exc()
-            if isinstance(e,TypeError):
-                error_msg=f"observation: {str(e)}"
+            error_traceback = traceback.format_exc()
+            if isinstance(e, TypeError):
+                error_msg = f"observation: {str(e)}"
             else:
-                error_msg=f"observation: {repr(e)} {error_traceback}"
+                error_msg = f"observation: {repr(e)} {error_traceback}"
             logger.error(f"Tool error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            cot.add_action(EnhancedCOT.Action(
+                next_thought=next_thought,
+                next_tool_name=next_tool_name,
+                next_tool_args=next_tool_args,
+                observation=error_msg,
+                is_error=True,
+                raw_response=raw_text,
+                total_attempts=total_attempts,
+                inference_error_counter=error_counter,
+                request_data=messages
+            ))
             continue
         
         if next_tool_name == "finish":
             logger.info('[CRITICAL] Workflow called finish operation')
             break
+            
         print(f"[CRITICAL] Completed step {step + 1}, continuing to next step")
+        
     else:
-        cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True))
+        # This happens if we exit the loop without breaking (reached MAX_STEPS)
+        cot.add_action(EnhancedCOT.Action(
+            next_thought="global timeout reached",
+            next_tool_name="", 
+            next_tool_args={},
+            observation="",
+            is_error=True,
+            inference_error_counter={},
+            request_data=[]
+        ))
         logger.info(f"[CRITICAL] Workflow completed after reaching MAX_STEPS ({n_max_steps})")
-        if n_max_steps < MAX_FIX_TASK_STEPS:
+        if n_max_steps < MAX_FIX_TASK_STEPS: # This is create task case and failed with smaller fix steps so try to use original solution supposing generated testcases are wrong
             return None
     
     logger.info(f"[CRITICAL] Workflow execution completed after {step + 1} steps")
