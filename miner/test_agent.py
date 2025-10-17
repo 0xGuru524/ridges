@@ -43,7 +43,7 @@ RUN_ID = os.getenv("RUN_ID", "")
 REPO_DIR = ""
 DEBUG_MODE = True
 
-GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
+GLM_MODEL_NAME = "zai-org/GLM-4.6-FP8"
 KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
 DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
 QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
@@ -347,10 +347,6 @@ You have access to the following tools:-
 FIX_TASK_INSTANCE_PROMPT_TEMPLATE = textwrap.dedent("""
 # Now let's start. Here is the problem statement:
 {problem_statement}
-Problem requirement document:
-{requirement}
-Problem Architecture:
-{architecture}
 """)
 
 
@@ -965,7 +961,226 @@ class EnhancedCOT:
         text = "\n".join(m["content"] for m in msgs)
         word_count = len(text.split())
         return int(word_count * 0.75)
+class CoTController:
+    """
+    Controller for managing and optimizing Chain-of-Thought reasoning.
+    Provides strategic guidance, summarization, and next-step planning.
+    """
+    
+    def __init__(self, max_context_actions: int = 30, reflection_interval: int = 5):
+        self.max_context_actions = max_context_actions
+        self.reflection_interval = reflection_interval
+        self.last_reflection_step = 0
+        self.strategic_goals = []
+        self.current_focus = ""
+        
+    def should_reflect(self, current_step: int, cot: EnhancedCOT) -> bool:
+        """Determine if it's time for a reflection cycle."""
+        if current_step - self.last_reflection_step >= self.reflection_interval:
+            return True
+        
+        # Also reflect if we're stuck in repetitive patterns
+        if cot.is_thought_repeated():
+            return True
+            
+        # Reflect if we've made significant progress or hit a roadblock
+        if len(cot.thoughts) > 0:
+            last_action = cot.thoughts[-1]
+            if last_action.is_error or "error" in last_action.observation.lower():
+                return True
+                
+        return False
+    
+    def analyze_cot_state(self, cot: EnhancedCOT) -> Dict[str, Any]:
+        """Analyze the current CoT state and provide insights."""
+        if not cot.thoughts:
+            return {"status": "initial", "recommendation": "Begin problem analysis"}
+        
+        recent_actions = cot.thoughts[-self.max_context_actions:]
+        
+        # Analyze patterns
+        tool_patterns = Counter(action.next_tool_name for action in recent_actions if action.next_tool_name)
+        error_patterns = [action for action in recent_actions if action.is_error]
+        success_patterns = [action for action in recent_actions if not action.is_error and action.next_tool_name]
+        
+        analysis = {
+            "total_steps": len(cot.thoughts),
+            "recent_tool_patterns": dict(tool_patterns),
+            "error_count": len(error_patterns),
+            "recent_errors": [err.observation for err in error_patterns[-3:]],
+            "current_focus": self._detect_current_focus(recent_actions),
+            "progress_indicators": self._assess_progress(recent_actions),
+            "potential_stuck_patterns": self._detect_stuck_patterns(recent_actions)
+        }
+        
+        return analysis
+    
+    def _detect_current_focus(self, recent_actions: List[EnhancedCOT.Action]) -> str:
+        """Detect what the agent is currently focused on."""
+        if not recent_actions:
+            return "Initial analysis"
+            
+        # Analyze tool usage patterns
+        tool_sequence = [action.next_tool_name for action in recent_actions if action.next_tool_name]
+        
+        if not tool_sequence:
+            return "Planning phase"
+            
+        last_tools = tool_sequence[-3:]  # Look at last 3 tools
+        
+        # Detect focus based on tool patterns
+        if any(tool in last_tools for tool in ["search_in_all_files_content", "search_in_specified_file_v2"]):
+            return "Code investigation"
+        elif any(tool in last_tools for tool in ["run_repo_tests", "run_code"]):
+            return "Testing and validation"
+        elif any(tool in last_tools for tool in ["apply_code_edit", "save_file"]):
+            return "Implementation"
+        elif "get_approval_for_solution" in last_tools:
+            return "Solution approval"
+        elif "generate_test_function" in last_tools:
+            return "Test generation"
+            
+        return "General problem solving"
+    
+    def _assess_progress(self, recent_actions: List[EnhancedCOT.Action]) -> List[str]:
+        """Assess what progress has been made."""
+        progress = []
+        
+        # Look for successful test runs
+        test_successes = [action for action in recent_actions 
+                         if action.next_tool_name == "run_repo_tests" 
+                         and not action.is_error 
+                         and "failed" not in str(action.observation).lower()]
+        if test_successes:
+            progress.append("Tests passing")
+            
+        # Look for successful code edits
+        successful_edits = [action for action in recent_actions 
+                           if action.next_tool_name == "apply_code_edit" 
+                           and not action.is_error]
+        if successful_edits:
+            progress.append("Code modifications applied")
+            
+        # Look for investigation findings
+        search_actions = [action for action in recent_actions 
+                         if "search" in action.next_tool_name 
+                         and not action.is_error 
+                         and "not found" not in str(action.observation).lower()]
+        if search_actions:
+            progress.append("Relevant code locations identified")
+            
+        return progress
+    
+    def _detect_stuck_patterns(self, recent_actions: List[EnhancedCOT.Action]) -> List[str]:
+        """Detect patterns indicating the agent might be stuck."""
+        stuck_patterns = []
+        
+        # Repeated tool calls with same arguments
+        if len(recent_actions) >= 2:
+            for i in range(1, len(recent_actions)):
+                if (recent_actions[i].next_tool_name == recent_actions[i-1].next_tool_name and
+                    recent_actions[i].next_tool_args == recent_actions[i-1].next_tool_args):
+                    stuck_patterns.append(f"Repeated {recent_actions[i].next_tool_name} calls")
+                    break
+        
+        # Many consecutive errors
+        consecutive_errors = 0
+        for action in reversed(recent_actions):
+            if action.is_error:
+                consecutive_errors += 1
+            else:
+                break
+        if consecutive_errors >= 3:
+            stuck_patterns.append(f"{consecutive_errors} consecutive errors")
+            
+        # Looping between tools without progress
+        if len(recent_actions) >= 4:
+            tool_sequence = [action.next_tool_name for action in recent_actions[-4:] if action.next_tool_name]
+            if len(tool_sequence) == 4 and len(set(tool_sequence)) <= 2:
+                stuck_patterns.append("Cycling between limited tools")
+                
+        return stuck_patterns
+    
+    def generate_reflection_prompt(self, cot: EnhancedCOT, problem_statement: str) -> str:
+        """Generate a reflection prompt for the LLM based on current CoT state."""
+        analysis = self.analyze_cot_state(cot)
+        
+        reflection_prompt = f"""
+# COT CONTROLLER REFLECTION CYCLE
 
+## CURRENT STATUS ANALYSIS:
+- Total steps taken: {analysis['total_steps']}
+- Current focus: {analysis['current_focus']}
+- Recent tool patterns: {analysis['recent_tool_patterns']}
+- Progress made: {', '.join(analysis['progress_indicators']) if analysis['progress_indicators'] else 'None yet'}
+- Potential issues: {', '.join(analysis['potential_stuck_patterns']) if analysis['potential_stuck_patterns'] else 'None detected'}
+
+## RECENT ERRORS (last 3):
+{chr(10).join(f"- {error}" for error in analysis['recent_errors']) if analysis['recent_errors'] else "No recent errors"}
+
+## PROBLEM STATEMENT:
+{problem_statement}
+
+## REFLECTION QUESTIONS:
+1. Based on the progress so far, what is the most critical next step?
+2. Are there any patterns in the recent errors that suggest a different approach?
+3. What evidence do we have that we're moving in the right direction?
+4. Are there any assumptions we should verify or alternative approaches to consider?
+5. What specific, actionable step should we take next and why?
+
+## INSTRUCTIONS:
+Provide a concise reflection that summarizes:
+- What we've accomplished so far
+- What we've learned from successes and failures  
+- The most promising direction forward
+- The exact next action to take
+
+End with a clear "NEXT STEP SUMMARY" that specifies the immediate next task.
+"""
+
+        return reflection_prompt
+    
+    def extract_next_step_summary(self, reflection_response: str) -> str:
+        """Extract the next step summary from the reflection response."""
+        lines = reflection_response.split('\n')
+        next_step_lines = []
+        in_next_step = False
+        
+        for line in lines:
+            if "NEXT STEP SUMMARY" in line.upper():
+                in_next_step = True
+                continue
+            if in_next_step and line.strip() and not line.strip().startswith('#'):
+                next_step_lines.append(line.strip())
+            elif in_next_step and not line.strip():
+                break
+                
+        if next_step_lines:
+            return ' '.join(next_step_lines)
+        
+        # Fallback: try to find the last actionable sentence
+        sentences = reflection_response.split('.')
+        for sentence in reversed(sentences):
+            if any(keyword in sentence.lower() for keyword in ['next', 'should', 'will', 'need to', 'must']):
+                return sentence.strip() + '.'
+                
+        return "Continue with current approach"
+    
+    def update_strategic_goals(self, reflection_response: str, current_step: int):
+        """Update strategic goals based on reflection."""
+        self.last_reflection_step = current_step
+        
+        # Extract key insights for future reference
+        lines = reflection_response.split('\n')
+        key_insights = []
+        
+        for line in lines:
+            line_lower = line.lower()
+            if any(term in line_lower for term in ['learned', 'discovered', 'found that', 'key insight']):
+                key_insights.append(line.strip())
+        
+        if key_insights:
+            self.strategic_goals.extend(key_insights[-3:])  # Keep last 3 insights
 class Utils:
     @classmethod
     def get_available_modules(cls) -> set[str]:
@@ -3801,16 +4016,14 @@ def process_create_task(input_dict):
 
     timeout = DEFAULT_TIMEOUT - (time.time()-start_time) - 60
     
-    patch = fix_task_solve_workflow(
+    patch = my_fix_task_solve_workflow(
         problem_statement,
         timeout=timeout,
         run_id_1=run_id,
         instance_id="",
         test_runner=f"unittest",
         test_runner_mode="FILE",
-        n_max_steps=100,
-        requirement=requirement,
-        architecture=architecture
+        n_max_steps=100
     )
 
     if patch is None:
@@ -4044,7 +4257,7 @@ def process_fix_task(input_dict: Dict[str, Any]):
         task_type="FIX"
             )
         messages = [
-            {"role": "system", "content": "You are a expert software requirements analyst. Generate comprehensive, well-structured requirement documents that are immediately actionable for development teams."},
+            {"role": "system", "content": "Act as a expert software requirements analyst. Generate comprehensive, well-structured requirement documents that are immediately actionable for development teams."},
             {"role": "user", "content": prompt}
             ]
         response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME)
@@ -4061,7 +4274,7 @@ def process_fix_task(input_dict: Dict[str, Any]):
         messages = [
         {
             "role": "system", 
-            "content": "You are a principal software architect. Provide complete technical specifications without omissions or examples."
+            "content": "Act as a principal software architect. Provide complete technical specifications without omissions or examples."
         },
         {
             "role": "user", 
@@ -4101,9 +4314,7 @@ def process_fix_task(input_dict: Dict[str, Any]):
                 run_id_1=RUN_ID,
                 instance_id="",
                 test_runner="pytest",
-                test_runner_mode="FILE",
-                requirement=requirement,
-                architecture=architecture
+                test_runner_mode="FILE"
             )
             return result
         except Exception as fallback_error:
@@ -4111,7 +4322,7 @@ def process_fix_task(input_dict: Dict[str, Any]):
             return ""
 
 def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str, instance_id: str = "", \
-    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS, requirement: str="", architecture: str="") -> tuple[str, List[str], List[str]]:
+    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
     global run_id
     run_id=run_id_1
     cot=EnhancedCOT()
@@ -4136,7 +4347,7 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
     )
     logger.info(f"Starting main agent execution...")
     system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(),format_prompt=FORMAT_PROMPT_V0)
-    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement, requirement="", architecture="")
+    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
     
     start_time = time.time()
     logs: List[str] = []
@@ -4210,6 +4421,152 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
         cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True))
         logger.info(f"[CRITICAL] Workflow completed after reaching MAX_STEPS ({n_max_steps})")
         if n_max_steps < MAX_FIX_TASK_STEPS: # This is create task case and failed with smaller fix steps so try to use original solution supposing generated testcases are wrong
+            return None
+    
+    logger.info(f"[CRITICAL] Workflow execution completed after {step + 1} steps")
+    logger.info(f"[CRITICAL] About to generate final patch...")
+    patch = tool_manager.get_final_git_patch()
+    logger.info(f"Final Patch Generated..: Length: {len(patch)}")
+
+    return patch
+def my_fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str, instance_id: str = "", \
+    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
+    global run_id
+    run_id=run_id_1
+    cot=EnhancedCOT()
+    
+    # Initialize CoT Controller
+    cot_controller = CoTController(
+        max_context_actions=30,
+        reflection_interval=5  # Reflect every 5 steps
+    )
+    
+    tool_manager=FixTaskEnhancedToolManager(
+        available_tools=[
+            "get_file_content",
+            "save_file", 
+            "get_approval_for_solution",
+            "get_functions",
+            "get_classes",
+            "search_in_all_files_content",
+            "search_in_specified_file_v2",
+            "start_over",
+            "run_repo_tests",
+            "run_code",
+            "apply_code_edit",
+            "generate_test_function",
+            "finish"
+        ],
+        test_runner=test_runner,
+        test_runner_mode=test_runner_mode
+    )
+    
+    logger.info(f"Starting main agent execution with CoT Controller...")
+    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(),format_prompt=FORMAT_PROMPT_V0)
+    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
+    
+    start_time = time.time()
+    logs: List[str] = []
+    logs.append(f"cwd: {os.getcwd()}")
+    logger.info(f"Starting workflow execution with {n_max_steps} max steps: timeout: {timeout} seconds : run_id: {run_id}")
+    
+    for step in range(n_max_steps):
+        logger.info(f"Execution step {step + 1}/{n_max_steps}")
+        
+        if time.time() - start_time > timeout:
+            cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True,inference_error_counter={},request_data=[]))
+            break
+
+        # COT CONTROLLER: Check if we should reflect
+        if cot_controller.should_reflect(step, cot):
+            logger.info(f"[COT_CONTROLLER] Reflection cycle triggered at step {step}")
+            
+            reflection_prompt = cot_controller.generate_reflection_prompt(cot, problem_statement)
+            
+            reflection_messages = [
+                {"role": "system", "content": "You are a strategic reasoning coordinator. Analyze the current progress and provide clear guidance for the next steps."},
+                {"role": "user", "content": reflection_prompt}
+            ]
+            
+            try:
+                reflection_response = EnhancedNetwork.make_request(reflection_messages, model=GLM_MODEL_NAME)
+                next_step_summary = cot_controller.extract_next_step_summary(reflection_response)
+                cot_controller.update_strategic_goals(reflection_response, step)
+                
+                logger.info(f"[COT_CONTROLLER] Next step summary: {next_step_summary}")
+                
+                # Add the reflection as a special thought
+                cot.add_action(EnhancedCOT.Action(
+                    next_thought=f"REFLECTION: {next_step_summary}",
+                    next_tool_name="",
+                    next_tool_args={},
+                    observation="Reflection cycle completed",
+                    is_error=False,
+                    raw_response=reflection_response
+                ))
+                
+            except Exception as e:
+                logger.error(f"[COT_CONTROLLER] Reflection failed: {e}")
+        
+        messages: List[Dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": instance_prompt},
+            ]
+        
+        messages.extend(cot.to_str())
+
+        messages.append({"role": "system", "content": STOP_INSTRUCTION})
+    
+        if cot.is_thought_repeated():
+            logger.info(f"[TEST_PATCH_FIND] Thought repeated, adding DO NOT REPEAT TOOL CALLS instruction")
+            last_thought = cot.thoughts[-1]
+            messages.append({"role": "user", "content": DO_NOT_REPEAT_TOOL_CALLS.format(previous_response=f"next_tool_name:{last_thought.next_tool_name}\n next_tool_args:{last_thought.next_tool_args}")})
+    
+        try:
+            next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages = EnhancedNetwork.inference(messages, model=GLM_MODEL_NAME, run_id=run_id)
+        except Exception as e:
+            import traceback
+            error_msg=f"\n\nERROR: {repr(e)} {traceback.format_exc()}"
+            logger.error(f"Inference error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=error_msg,next_tool_name="",next_tool_args={},observation="",is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            break
+        
+        logger.info(f"About to execute operation: {next_tool_name}")
+       
+        try:
+            logger.info(f"next_thought: {next_thought}\nnext_tool_name: {next_tool_name}\nnext_tool_args: {next_tool_args}\n")
+            if '"' in next_tool_name or "'" in next_tool_name:
+                next_tool_name=next_tool_name.replace('"','')
+                next_tool_name=next_tool_name.replace("'","")
+                
+            next_observation = tool_manager.get_tool(next_tool_name)(**next_tool_args) if next_tool_args else tool_manager.get_tool(next_tool_name)()
+            logger.info(f"next_observation: {next_observation}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=next_observation,is_error=False,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+        except EnhancedToolManager.Error as e:
+            import traceback
+            error_msg=f"observation: {e.message}"
+            logger.error(f"Tool error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            continue
+        except Exception as e:
+            import traceback
+            error_traceback=traceback.format_exc()
+            if isinstance(e,TypeError):
+                error_msg=f"observation: {str(e)}"
+            else:
+                error_msg=f"observation: {repr(e)} {error_traceback}"
+            logger.error(f"Tool error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            continue
+        
+        if next_tool_name == "finish":
+            logger.info('[CRITICAL] Workflow called finish operation')
+            break
+        print(f"[CRITICAL] Completed step {step + 1}, continuing to next step")
+    else:
+        cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True))
+        logger.info(f"[CRITICAL] Workflow completed after reaching MAX_STEPS ({n_max_steps})")
+        if n_max_steps < MAX_FIX_TASK_STEPS:
             return None
     
     logger.info(f"[CRITICAL] Workflow execution completed after {step + 1} steps")
