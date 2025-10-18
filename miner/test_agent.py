@@ -1813,7 +1813,7 @@ class EnhancedNetwork:
             {"role":"system", "content":"Fix the json string sent by the user.  Reply only with the json string and nothing else."},
             {"role":"user", "content":json_string}
         ]
-        response=cls.make_request(messages, model=DEEPSEEK_MODEL_NAME)
+        response=cls.make_request(messages, model=QWEN_MODEL_NAME)
         try:
             response=response.replace('```json','').strip('```')
             response=json.loads(response)
@@ -3834,7 +3834,7 @@ def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo", test_mode: bo
     repo_dir = os.path.abspath(repo_dir)
     REPO_DIR = repo_dir
     if test_mode:
-        DEFAULT_TIMEOUT = 1156
+        DEFAULT_TIMEOUT = 2000
         MAX_TEST_PATCH_TIMEOUT = 400
     
     sys.path.insert(0, repo_dir)
@@ -3959,7 +3959,7 @@ def post_process_instruction(instruction: str) -> str:
     processed_instruction = re.sub(pattern, replace_text_block, instruction, flags=re.DOTALL)
     return processed_instruction
 
-def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
+def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str, requirement: str, architecture: str) -> str:
     retry = 0
     code_generation_messages = [
         {
@@ -3968,7 +3968,7 @@ def generate_solution_with_multi_step_reasoning(problem_statement: str, code_ske
         },
         {
             "role": "user",
-            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
+            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nRequirement document:\n{requirement}\n\nArchitecture:\n{architecture}\n\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
         }
     ]
     while retry < 10:
@@ -4005,13 +4005,13 @@ def generate_solution_with_multi_step_reasoning(problem_statement: str, code_ske
     
     return ""
 
-def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
+def generate_initial_solution(problem_statement: str, code_skeleton: str, requirement: str, architecture: str) -> str:
     retry = 0
     while retry < 10:
         try:
             logger.info("Starting multi-step reasoning solution generation")
             
-            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton)
+            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton, requirement, architecture)
             
             if solution:
                 logger.info("Generated initial solution successfully using multi-step reasoning")
@@ -4027,7 +4027,7 @@ def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str
                     },
                     {
                         "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nRequirement document:\n\nGenerate the complete and correct implementation in python files."""
+                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nRequirement document:\n{requirement}\n\nArchitecture:\n{architecture}\n\nGenerate the complete and correct implementation in python files."""
                     }
                 ]
                 
@@ -4442,10 +4442,10 @@ def process_create_task(input_dict):
             {"role": "system", "content": "You are a expert software requirements analyst. Generate comprehensive, well-structured requirement documents that are immediately actionable for development teams."},
             {"role": "user", "content": prompt}
             ]
-        response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME)
+        response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
         return response if response else ""
-    #requirement = requirement_analysis(problem_statement, code_skeleton)
-    #logger.info(f"[REQUIREMENT]\n{requirement}")
+    requirement = requirement_analysis(problem_statement, code_skeleton)
+    logger.info(f"[REQUIREMENT]\n{requirement}")
     def architecture_analyzer(problem_statement: str, code_skeleton: str, requirement: str) -> str:
         prompt = ARCHITECTURE_ANALYSIS_PROMPT.format(
             problem_statement=problem_statement,
@@ -4462,13 +4462,13 @@ def process_create_task(input_dict):
             "role": "user", 
             "content": prompt
         }]
-        response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME,)
+        response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME,)
         return response if response else ''
-    #architecture = architecture_analyzer(problem_statement=problem_statement, code_skeleton=code_skeleton, requirement=requirement)
-    #logger.info(f"[ARCHITECTURE]\n{architecture}")
+    architecture = architecture_analyzer(problem_statement=problem_statement, code_skeleton=code_skeleton, requirement=requirement)
+    logger.info(f"[ARCHITECTURE]\n{architecture}")
     
     code_skeleton = get_code_skeleton()
-    initial_solution = generate_initial_solution(problem_statement, code_skeleton)
+    initial_solution = generate_initial_solution(problem_statement, code_skeleton, requirement, architecture)
     initial_solution = enhance_solution_with_constants(problem_statement, initial_solution)
     initial_solution = fix_lazy_property_generation(problem_statement, initial_solution)
     initial_solution = fix_recursive_word_definitions(problem_statement, initial_solution)
@@ -4598,7 +4598,7 @@ def find_test_runner(readme_file_path: Optional[str] = None):
         response = EnhancedNetwork.make_request([
             {"role": "system", "content": FIND_TEST_RUNNER_PROMPT},
             {"role": "user", "content": readme_content}
-        ], model=DEEPSEEK_MODEL_NAME)
+        ], model=QWEN_MODEL_NAME)
         return response.strip() or "pytest"
     except Exception as e:
         logger.error(f"Error finding test runner: {e}")
@@ -4646,7 +4646,7 @@ def get_test_runner_mode(test_runner: str):
         response = EnhancedNetwork.make_request([
             {"role": "system", "content": TEST_RUNNER_MODE_PROMPT},
             {"role": "user", "content": runner_content}
-        ], model=DEEPSEEK_MODEL_NAME)
+        ], model=QWEN_MODEL_NAME)
         return response.strip() or "FILE"
     except Exception as e:
         logger.error(f"Error determining test runner mode: {e}")
@@ -4724,7 +4724,7 @@ def process_fix_task(input_dict: Dict[str, Any]):
             {"role": "system", "content": "Act as a expert software requirements analyst. Generate comprehensive, well-structured requirement documents that are immediately actionable for development teams."},
             {"role": "user", "content": prompt}
             ]
-        response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME)
+        response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
         return response if response else ""
     requirement = requirement_analysis(problem_statement, code_skeleton)
     logger.info(f"[REQUIREMENT]\n{requirement}")
@@ -4744,7 +4744,7 @@ def process_fix_task(input_dict: Dict[str, Any]):
             "role": "user", 
             "content": prompt
         }]
-        response = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME,)
+        response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME,)
         return response if response else ''
     architecture = architecture_analyzer(problem_statement=problem_statement, code_skeleton=code_skeleton, requirement=requirement)
     logger.info(f"[ARCHITECTURE]\n{architecture}")
