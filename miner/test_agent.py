@@ -1795,7 +1795,7 @@ class EnhancedNetwork:
         url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
         print("[REQUEST] run_id:", run_id)
         print("[REQUEST] model:", model)
-        print("[REQUEST] messages:", messages)
+        print("[REQUEST] messages:", messages[0:500])
         # Cache miss - make the actual request
         request_data = {
                 "run_id": run_id if run_id else "1",
