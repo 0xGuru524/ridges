@@ -34,10 +34,6 @@ DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://sandbox_proxy")
 DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "1800"))
 MAX_TEST_PATCH_TIMEOUT = int(os.getenv("MAX_STEPS_TEST_PATCH_FIND", "400"))
 
-# Embedding configuration
-MAX_EMBED_TOKENS = 128000  # Reduced from 512000 for faster processing
-MAX_EMBED_CHARS = MAX_EMBED_TOKENS * 4  # reserve but we'll split by tokens
-EMBED_MODEL_NAME = "agentica-org/DeepCoder-14B-Preview"
 USE_FUNCTION_CHUNKS = os.getenv("EMBED_WHOLE_FILES", "0") != "1"
 RUN_ID = os.getenv("RUN_ID", "")
 REPO_DIR = ""
@@ -60,33 +56,6 @@ You are the problem type checker that will categories problem type into:
 Only respond with the "FIX" or "CREATE".
 '''
 )
-
-ONESHOT_SYSTEM_PROMPT = """
-You are an autonomous programmer. The user will provide a bug report or 
-feature request (the "problem") plus a compact summary of the most 
-relevant repository files.  Your job is to return ONE *valid* unified 
-diff patch that fixes the problem. If you have any questions, do not ask the user. 
-Instead, solve it to the best of your ability with the knowledge you have.
-
-You will be provided with a summary of the repository files that are most relevant to the problem.
-Your patch must be valid and apply cleanly when run from the repository root.
-
-STRICT FORMAT RULES
-1. Return *only* the diff – no prose, no Markdown back-ticks.
-2. The diff must start with 'diff --git a/<path> b/<path>' followed by 
-   the standard "--- a/<path>" and "+++ b/<path>" headers.
-3. Use -u style context hunks that begin with lines like @@ -N,M +N,M @@.
-4. Every changed file needs its own header block as in rule 2.
-5. End the patch with a trailing newline.
-
-Be exact: if the diff is syntactically malformed or wrapped in extra 
-text the automated patch tool will fail.
-
-OUTPUT RULES (VERY IMPORTANT, STRICT)
-• You MUST end your reply with a *raw* JSON object with "code_response" property – nothing else.
-• Must hold the unified diff from rules 1-5 *verbatim*.
-Example: {"code_response": "diff --git a/foo.py b/foo.py\n..."}
-"""
 
 DO_NOT_REPEAT_TOOL_CALLS=textwrap.dedent("""
 You're not allowed to repeat the same tool call with the same arguments.
@@ -342,7 +311,7 @@ FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
 
 ## REASONING STRATEGY WITH CoT CONTROLLER
 You are equipped with an advanced CoT Controller that:
-- **Reads your entire thought process** every 5 steps
+- **Reads your entire thought process** every {step} steps
 - **Validates each reasoning step** against complete history  
 - **Provides strategic guidance** based on pattern analysis
 - **Detects stuck patterns** and suggests course corrections
@@ -356,7 +325,7 @@ You are equipped with an advanced CoT Controller that:
 ## REFLECTION INTEGRATION
 - When you see "STRATEGIC_REFLECTION:" in thoughts, it contains analyzed guidance
 - "VALIDATION_WARNING:" indicates potential issues with current reasoning direction  
-- Reflection cycles happen every 5 steps automatically
+- Reflection cycles happen every {step} steps automatically
 - Use strategic guidance to maintain optimal trajectory
 
 ## CONTROLLER FEATURES UTILIZATION
@@ -381,7 +350,6 @@ FIX_TASK_INSTANCE_PROMPT_TEMPLATE = textwrap.dedent("""
 # Now let's start. Here is the problem statement:
 {problem_statement}
 """)
-
 
 FIND_TEST_RUNNER_PROMPT = textwrap.dedent("""\
 You are a helpful assistant that can find the test runner for a given repository.
@@ -419,8 +387,6 @@ Generate a comprehensive, well-structured requirement analysis document by syste
 
 ### CODE SKELETON:
 {code_skeleton}
-
-**Confirmed Task Type:** {task_type}
 
 ## DOCUMENT STRUCTURE REQUIREMENTS
 
@@ -619,8 +585,6 @@ Analyze the technical constraints and design an implementation architecture that
 **Validated Requirements:**
 {requirement_document}
 
-**Confirmed Task Type:** {task_type}
-
 ## MANDATORY ANALYSIS FRAMEWORK
 
 ### 1. IMMUTABLE ARCHITECTURAL CONSTRAINTS IDENTIFICATION
@@ -817,6 +781,7 @@ Generate the architecture analysis using exactly the section headers and structu
 
 Begin the analysis now.
 """)
+
 FORMAT_PROMPT_V0=textwrap.dedent("""
 **📝 Response Format Requirements**
 
@@ -1001,7 +966,7 @@ class CoTController:
     Reads entire thought process, validates reasoning, and provides strategic guidance.
     """
     
-    def __init__(self, reflection_interval: int = 5, reasoning_model: str = QWEN_MODEL_NAME, reflection_model: str = DEEPSEEK_MODEL_NAME):
+    def __init__(self, reflection_interval: int = 5, reasoning_model: str = QWEN_MODEL_NAME, reflection_model: str = QWEN_MODEL_NAME):
         self.reflection_interval = reflection_interval
         self.last_reflection_step = 0
         self.strategic_goals = []
@@ -1829,7 +1794,8 @@ class EnhancedNetwork:
         global run_id
         url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
         print("[REQUEST] run_id:", run_id)
-
+        print("[REQUEST] model:", model)
+        print("[REQUEST] messages:", messages)
         # Cache miss - make the actual request
         request_data = {
                 "run_id": run_id if run_id else "1",
@@ -3158,616 +3124,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         else: 
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.BUG_REPORT_REQUIRED.name,qa_response.get("analysis",""))
 
-# ---------------------------------------------------------------------------
-# Chunk representation and collector ---------------------------------------
-# ---------------------------------------------------------------------------
-
-class Chunk(NamedTuple):
-    file: str
-    start_line: int
-    end_line: int
-    text: str
-
-
-def _guess_tokens(text: str) -> int:
-    """Rough token count estimate: ~0.75 tokens per word."""
-    return int(len(text.split()) * 0.75)
-
-
-def _collect_code_chunks(root: str = ".") -> List[Chunk]:
-    """Collect function-level code chunks from Python files."""
-    chunks: List[Chunk] = []
-    
-    for root, _, files in os.walk(root):
-        # Skip hidden directories and common non-source dirs
-        if any(part.startswith('.') for part in Path(root).parts):
-            continue
-        if root.endswith(('__pycache__', 'node_modules', '.git')):
-            continue
-            
-        for file in files:
-            if not file.endswith('.py'):
-                continue
-                
-            file_path = os.path.join(root, file)
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-            except (UnicodeDecodeError, PermissionError):
-                continue
-                
-            try:
-                tree = ast.parse(content, filename=file_path)
-            except SyntaxError:
-                continue
-                
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    start_line = getattr(node, 'lineno', 1)
-                    end_line = getattr(node, 'end_lineno', start_line)
-                    
-                    if end_line is None:
-                        # Fallback: count lines in the node
-                        lines = content.split('\n')
-                        if start_line <= len(lines):
-                            node_text = '\n'.join(lines[start_line-1:])
-                            end_line = start_line + node_text.count('\n')
-                        else:
-                            end_line = start_line
-                    
-                    # Extract the actual source lines
-                    lines = content.split('\n')
-                    if start_line <= len(lines) and end_line <= len(lines):
-                        chunk_text = '\n'.join(lines[start_line-1:end_line])
-                        
-                        # Skip if chunk is too large
-                        if len(chunk_text) > MAX_EMBED_CHARS:
-                            continue
-                            
-                        chunks.append(Chunk(
-                            file=file_path,
-                            start_line=start_line,
-                            end_line=end_line,
-                            text=chunk_text
-                        ))
-                        
-            # Also add the entire file as a chunk if it's reasonably sized
-            if len(content) <= MAX_EMBED_CHARS and content.strip():
-                chunks.append(Chunk(
-                    file=file_path,
-                    start_line=1,
-                    end_line=content.count('\n') + 1,
-                    text=content
-                ))
-    
-    return chunks
-
-
-def _token_windows(text: str, max_tokens: int = MAX_EMBED_TOKENS) -> List[str]:
-    """Split text into token-limited windows."""
-    words = text.split()
-    windows = []
-    
-    for i in range(0, len(words), max_tokens):
-        window_words = words[i:i + max_tokens]
-        windows.append(' '.join(window_words))
-    
-    return windows
-
-
-def _lang_tag(path: str) -> str:
-    """Return language tag for syntax highlighting."""
-    ext = os.path.splitext(path)[1].lower()
-    lang_map = {
-        '.py': 'python',
-        '.js': 'javascript',
-        '.ts': 'typescript',
-        '.java': 'java',
-        '.cpp': 'cpp',
-        '.c': 'c',
-        '.h': 'c',
-        '.hpp': 'cpp',
-        '.cs': 'csharp',
-        '.go': 'go',
-        '.rs': 'rust',
-        '.php': 'php',
-        '.rb': 'ruby',
-        '.swift': 'swift',
-        '.kt': 'kotlin',
-        '.scala': 'scala',
-        '.r': 'r',
-        '.m': 'matlab',
-        '.sh': 'bash',
-        '.sql': 'sql',
-        '.html': 'html',
-        '.css': 'css',
-        '.xml': 'xml',
-        '.yaml': 'yaml',
-        '.yml': 'yaml',
-        '.json': 'json',
-        '.md': 'markdown',
-        '.txt': 'text',
-    }
-    return lang_map.get(ext, 'text')
-
-
-def _collect_repo_texts(root: str = ".") -> Dict[str, str]:
-    """Collect all text content from repository files."""
-    texts: Dict[str, str] = {}
-    
-    for root, _, files in os.walk(root):
-        # Skip hidden directories and common non-source dirs
-        if any(part.startswith('.') for part in Path(root).parts):
-            continue
-        if root.endswith(('__pycache__', 'node_modules', '.git')):
-            continue
-            
-        for file in files:
-            file_path = os.path.join(root, file)
-            
-            # Skip binary files and very large files
-            if file.endswith(('.png', '.jpg', '.jpeg', '.gif', '.ico', '.pdf', '.zip', '.tar', '.gz')):
-                continue
-                
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    
-                # Skip if file is too large
-                if len(content) > MAX_EMBED_CHARS:
-                    continue
-                    
-                texts[file_path] = content
-                
-            except (UnicodeDecodeError, PermissionError):
-                continue
-
-    return texts
-
-
-# ---------------------------------------------------------------------------
-# Embedding cache and helper -------------------------------------------------
-# ---------------------------------------------------------------------------
-
-_EMBED_CACHE: Dict[str, List[float]] = {}
-ZERO_VEC: List[float] = [0.0] * 1024  # embedding for empty input
-
-
-def _remote_embed(text: str, proxy_url: str, run_id: str) -> List[float]:
-    """Return embedding vector for *text* via the proxy /api/embedding endpoint.
-
-    Caches results in-memory to avoid duplicate HTTP calls.
-    """
-    print(f"[Agent] Embedding request: {len(text)} chars")
-    # Short-circuit empty or whitespace-only inputs.
-    if not text.strip():
-        return _EMBED_CACHE.setdefault("", [0.0] * 1024)
-
-    # Retry–shrink loop to satisfy 512-token limit
-    attempt_text = text
-    for _ in range(2):  # original + 1 retry after halving
-        tokens = attempt_text.split()
-        if len(tokens) > MAX_EMBED_TOKENS:
-            attempt_text = " ".join(tokens[:MAX_EMBED_TOKENS])
-
-        url = f"{proxy_url.rstrip('/')}/api/embedding"
-        req = _urlreq.Request(
-            url,
-            data=json.dumps({"input": attempt_text, "run_id": run_id}, ensure_ascii=False).encode(),
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-
-        try:
-            with _urlreq.urlopen(req, timeout=60) as resp:  # Reduced timeout from 300 to 60
-                data_raw = resp.read()
-                data = json.loads(data_raw.decode())
-                print(f"[Agent] Embedding response: {len(data)} bytes")
-
-                if isinstance(data, list):
-                    vec = data[0] if (len(data) == 1 and isinstance(data[0], list)) else data
-                    _EMBED_CACHE[text] = vec
-                    return vec
-                if isinstance(data, dict) and "embedding" in data:
-                    vec = data["embedding"]
-                    _EMBED_CACHE[text] = vec
-                    return vec
-
-                # If we received a validation error about tokens, halve and retry
-                if isinstance(data, dict) and data.get("error_type") == "Validation":
-                    attempt_text = " ".join(tokens[: len(tokens) // 2])
-                    continue
-
-                return ZERO_VEC
-        except Exception as e:
-            print(f"[Agent] Embedding error: {e}")
-            return ZERO_VEC
-
-    return ZERO_VEC
-
-
-def _cosine(u: List[float], v: List[float]) -> float:
-    """Compute cosine similarity between two vectors."""
-    nu = math.sqrt(sum(x * x for x in u))
-    nv = math.sqrt(sum(x * x for x in v))
-
-    if nu == 0 or nv == 0:
-        return 0.0
-
-    return sum(x * y for x, y in zip(u, v)) / (nu * nv)
-
-
-# ---------------------------------------------------------------------------
-# One-shot retrieval using remote embeddings --------------------------------
-# ---------------------------------------------------------------------------
-
-def run_oneshot(
-    problem_text: str,
-    *,
-    proxy_url: str,
-    model_name: str,
-    run_id: str,
-    top_k: int = 30,
-) -> str:
-    """Build repository summary and send a single LLM call.
-
-    Embeddings are fetched from the internal `/api/embedding` proxy endpoint, so no model weights or internet access are required inside the sandbox.
-    """
-    print(f"[Agent] One-shot mode: {len(problem_text)} chars problem")
-    if USE_FUNCTION_CHUNKS:
-        code_chunks = _collect_code_chunks()
-        if not code_chunks:
-            raise RuntimeError("repository appears empty – nothing to embed")
-        chunk_texts = [c.text for c in code_chunks]
-    else:
-        repo_texts = _collect_repo_texts()
-        if not repo_texts:
-            raise RuntimeError("repository appears empty – nothing to embed")
-        code_chunks = [Chunk(file=fp, start_line=1, end_line=text.count("\n") + 1, text=text) for fp, text in repo_texts.items()]
-        chunk_texts = [c.text for c in code_chunks]
-
-    # --------------------------------------------------------------------
-    # Cheap TF-IDF pre-filter to limit expensive embedding calls ----------
-    # --------------------------------------------------------------------
-
-    PRE_FILTER_TOP = int(os.getenv("PREFILTER_TOP", "50"))  # Reduced from 200 for faster processing
-
-    if len(chunk_texts) > PRE_FILTER_TOP:
-        # Simple TF-IDF scoring
-        problem_words = set(problem_text.lower().split())
-        chunk_scores = []
-        
-        for chunk_text in chunk_texts:
-            chunk_words = set(chunk_text.lower().split())
-            common_words = problem_words.intersection(chunk_words)
-            score = len(common_words) / max(len(problem_words), 1)
-            chunk_scores.append(score)
-        
-        # Keep top chunks by TF-IDF score
-        sorted_indices = sorted(range(len(chunk_scores)), key=lambda i: -chunk_scores[i])
-        top_indices = sorted_indices[:PRE_FILTER_TOP]
-        
-        code_chunks = [code_chunks[i] for i in top_indices]
-        chunk_texts = [chunk_texts[i] for i in top_indices]
-
-    # --------------------------------------------------------------------
-    # Embed problem text and all chunks ----------------------------------
-    # --------------------------------------------------------------------
-
-    query_vec = _remote_embed(problem_text, proxy_url, run_id)
-    chunk_vecs: List[List[float]] = [None] * len(chunk_texts)  # type: ignore
-
-    MAX_WORKERS = min(8, int(os.getenv("EMBED_CONCURRENCY", "8")))  # Increased concurrency
-
-    print(f"[Agent] Embedding {len(chunk_texts)} chunks with {MAX_WORKERS} workers")
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        fut_to_idx = {pool.submit(safe_remote_embed, txt, proxy_url, run_id): idx for idx, txt in enumerate(chunk_texts)}
-
-        for fut in as_completed(fut_to_idx):
-            idx = fut_to_idx[fut]
-            try:
-                chunk_vecs[idx] = fut.result()
-            except Exception as exc:
-                # Log and keep zero vector; retrieval will simply rank it low.
-                print(f"[agent] embedding error (chunk {idx}): {exc}")
-                chunk_vecs[idx] = ZERO_VEC
-
-    sims = [ _cosine(vec, query_vec) for vec in chunk_vecs ]
-
-    # --------------------------------------------------------------------
-    # Light path-based bonus if filename is mentioned in the problem text --
-    # --------------------------------------------------------------------
-    prob_lower = problem_text.lower()
-    for idx, ch in enumerate(code_chunks):
-        base = os.path.basename(ch.file).lower()
-        if base in prob_lower or base.split(".")[0] in prob_lower:
-            sims[idx] += 0.2
-
-    sorted_idx = sorted(range(len(sims)), key=lambda i: -sims[i])
-
-    TARGET_TOKENS = 6_000  # Reduced from 12_000 for faster processing
-    token_budget = int(TARGET_TOKENS * 0.85)
-    token_total = 0
-    top_idx: list[int] = []
-    for idx in sorted_idx:
-        tok = _guess_tokens(chunk_texts[idx])
-        if token_total + tok > token_budget:
-            break
-        token_total += tok
-        top_idx.append(idx)
-
-    # Fallback to at most top_k if budget yields too many
-    if len(top_idx) > top_k:
-        top_idx = top_idx[:top_k]
-
-    summary_parts: list[str] = []
-    for idx in top_idx:
-        ch = code_chunks[idx]
-        body = ch.text[:5000]
-        tag = _lang_tag(ch.file)
-        header = f"### {ch.file}:L{ch.start_line}-{ch.end_line}"
-        summary_parts.append(f"{header}\n```{tag}\n{body}\n```")
-
-    repo_summary = "\n\n".join(summary_parts)
-
-    # --------------------------------------------------------------------
-    # Build initial conversation messages.
-    # --------------------------------------------------------------------
-
-    print(f"[Agent] Repository summary: {len(repo_summary)} chars, {len(top_idx)} chunks, {token_total} tokens")
-    print(f"[Agent] repo_summary:\n{repo_summary}")
-    messages = [
-        {"role": "system", "content": ONESHOT_SYSTEM_PROMPT},
-        {"role": "user", "content": problem_text},
-        {"role": "user", "content": "Repository summary (top files):\n\n" + repo_summary},
-    ]
-
-    proxy_resp = inference_for_oneshot_embedding(messages, proxy_url, run_id, model_name)
-
-    print(f"[agent] Proxy response received: {proxy_resp}")
-    code_resp = proxy_resp.get("code_response", "")
-
-    patch_text = None
-    # if code_resp and (code_resp.startswith("diff") or code_resp.startswith("--- ")):
-    patch_text = code_resp
-    # Sanitize diff to strip markdown fences and chatter
-    patch_text = _sanitize_patch(patch_text)
-    print(f"[agent] Sanitized patch : {patch_text}")
-
-    ok, dry_out = _dry_run_patch(patch_text)
-    if ok:
-        result = _apply_patch(patch_text)
-        print(f"[agent] Patch applied. patch:\n{patch_text}\n{result}")
-        return patch_text
-    else:
-        print(f"[agent] Patch failed to apply. patch:\n'{patch_text}'\n{dry_out}")
-        # Patch failed – append feedback and ask for correction.
-        messages.append({"role": "assistant", "content": code_resp[:200]})
-        messages.append({"role": "user", "content": "Patch failed to apply. Please reply with a corrected unified diff only."})
-        raise RuntimeError(f"[agent] Patch could not be applied through oneshot embedding.")
-
-
-def safe_remote_embed(text, proxy_url, run_id, max_retries=3):  # Reduced retries from 5 to 3
-    for attempt in range(max_retries):
-        try:
-            return _remote_embed(text, proxy_url, run_id)
-        except Exception as e:
-            sleep_time = 2  # Reduced sleep time from 10 to 2 seconds
-            print(f"Rate limited, retrying in {sleep_time:.1f}s...")
-            time.sleep(sleep_time)
-    return ZERO_VEC
-
-
-def _apply_patch(patch: str) -> str:
-    """Apply a git patch and return the result."""
-    try:
-        # Write patch to temporary file
-        with open(".temp_patch", "w") as f:
-            f.write(patch)
-        
-        # Apply the patch
-        result = subprocess.run(
-            ["git", "apply", ".temp_patch"],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        if result.returncode == 0:
-            # Generate final patch
-            final_patch = subprocess.run(
-                ["git", "diff"],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            return final_patch.stdout
-        else:
-            print(f"Patch application failed: {result.stderr}")
-            return ""
-            
-    except Exception as e:
-        print(f"Error applying patch: {e}")
-        return ""
-    finally:
-        # Clean up temporary file
-        try:
-            os.remove(".temp_patch")
-        except:
-            pass
-
-
-def inference_for_oneshot_embedding(messages: List[Dict[str, Any]], proxy_url: str, run_id: str, model: str = None) -> dict:
-    """Send inference request to the proxy and return the response."""
-    # Build request data
-    request_data = {
-        "run_id": run_id,
-        "messages": messages,
-        "temperature": 0
-    }
-    
-    if model:
-        request_data["model"] = model
-
-    # Send HTTP request
-    url = f"{proxy_url.rstrip('/')}/api/inference"
-    request_bytes = json.dumps(request_data, ensure_ascii=False).encode('utf-8')
-    
-    print(f"[agent] Making inference request to {url}")
-    
-    try:
-        req = _urlreq.Request(url, data=request_bytes, method="POST")
-        req.add_header("Content-Type", "application/json")
-        
-        with _urlreq.urlopen(req, timeout=120) as resp:  # Reduced timeout from 600 to 120
-            response_chunks = []
-            while True:
-                chunk = resp.read(8192)
-                if not chunk:
-                    break
-                response_chunks.append(chunk)
-            response_body = b"".join(response_chunks)
-            # response_body = resp.read()
-            print(f"[agent] HTTP {resp.status} from {url} ({len(response_body)} bytes)")
-            
-            response_txt = response_body.decode("utf-8")
-            response_json = json.loads(response_txt)
-            
-            # The proxy may return a plain string instead of a JSON object with
-            # separate text / code fields.  In that case we wrap it in the
-            # expected shape so downstream logic can stay unchanged.
-           
-            if isinstance(response_json, str):
-                if response_json.find("code_response") != -1:
-                    response_json = json.loads(response_json)
-                else:
-                    raw_text: str = response_json
-                    # Attempt to separate a unified diff from the explanatory text.
-                    diff_start = None
-                    if raw_text.startswith("diff") or raw_text.startswith("--- "):
-                        diff_start = 0
-                    else:
-                        # Look for the first occurrence of a diff header inside the text.
-                        for marker in ("\ndiff --git", "\n--- "):
-                            idx = raw_text.find(marker)
-                            if idx != -1:
-                                diff_start = idx + 1  # skip the leading newline
-                                break
-
-                    code_resp = raw_text
-                    if diff_start is not None:
-                        code_resp = raw_text[diff_start:].lstrip()
-
-                    response_json = {"code_response": code_resp}
-
-            return response_json
-
-            
-    except Exception as e:
-        print(f"[agent] Inference request failed: {e}")
-        raise RuntimeError(f"Inference request failed: {e}")
-
-
-def _sanitize_patch(patch: str) -> str:
-    """Return *patch* stripped of markdown/code-fence chatter.
-
-    The LLM sometimes wraps the unified diff in Markdown fences or appends
-    explanatory text (e.g. `DISCUSSION`, `EOF`).  This helper keeps only the
-    lines that are valid in a unified diff so downstream tools (`patch`,
-    `git apply`) succeed and the resulting patch file is clean.
-    """
-    # Stop at the first closing code fence (```), if present.
-    stop_idx = patch.find("\n```")
-    if stop_idx != -1:
-        patch = patch[:stop_idx]
-
-    allowed_prefixes = (
-        "diff --git",
-        "index ",
-        "--- ",
-        "+++ ",
-        "@@",
-        "new file mode",
-        "deleted file mode",
-        "similarity index",
-        "rename from",
-        "rename to",
-        "Binary files",
-        "\\ No newline",
-    )
-
-    cleaned_lines: list[str] = []
-    for line in patch.splitlines():
-        # Early exit markers – anything after is junk.
-        if line.strip() in {"DISCUSSION", "EOF"}:
-            break
-        if line.startswith(allowed_prefixes):
-            cleaned_lines.append(line)
-            continue
-        # Hunk content lines start with space, plus or minus.
-        if line.startswith(("+", "-", " ")):
-            cleaned_lines.append(line)
-            continue
-        # Ignore everything else (markdown, commentary, empty lines outside hunks).
-
-    # Post-process header lines: ensure 'a/' and 'b/' prefixes so a default
-    # `patch -p1` invocation resolves correctly when run from the repository
-    # root.  We intentionally *do not* touch paths pointing to /dev/null.
-    for idx, ln in enumerate(cleaned_lines):
-        if ln.startswith("--- ") and not ln.startswith("--- a/") and not ln.startswith("--- /dev/null"):
-            cleaned_lines[idx] = "--- a/" + ln[4:]
-        elif ln.startswith("+++ ") and not ln.startswith("+++ b/") and not ln.startswith("+++ /dev/null"):
-            cleaned_lines[idx] = "+++ b/" + ln[4:]
-
-    return "\n".join(cleaned_lines) + "\n"
-
-
-def _dry_run_patch(patch: str) -> tuple[bool, str]:
-    """Validate patch without applying it."""
-    try:
-        # Sanitize the patch first
-        sanitized_patch = _sanitize_patch(patch)
-        
-        if not sanitized_patch.strip():
-            return False, "Empty patch"
-        
-        # Write to temporary file
-        with open(".temp_patch", "w") as f:
-            f.write(sanitized_patch)
-        
-        # Try to apply with --check flag
-        result = subprocess.run(
-            ["git", "apply", "--check", ".temp_patch"],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        return result.returncode == 0, result.stderr
-        
-    except Exception as e:
-        return False, str(e)
-    finally:
-        # Clean up
-        try:
-            os.remove(".temp_patch")
-        except:
-            pass
-
-
-def process_task_with_oneshot_embedding(input_dict: Dict[str, Any]):
-    """Process task using oneshot embedding approach."""
-    problem_text = input_dict.get("problem_statement")
-    result = run_oneshot(
-        problem_text,
-        proxy_url=DEFAULT_PROXY_URL,
-        model_name=EMBED_MODEL_NAME,
-        run_id=RUN_ID,
-    )
-
-    return result
-
-
 def ensure_git_initialized():
     """Initialize git repository if not already initialized, with temporary config."""
     print("[DEBUG] Starting git initialization check...")
@@ -3848,18 +3204,15 @@ def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo", test_mode: bo
 
     # Check problem type first
     problem_type = check_problem_type(input_dict.get("problem_statement"))
-    
-    if problem_type == PROBLEM_TYPE_FIX:
-        # Use embedding-based approach for FIX tasks
-        try:
-            result = process_fix_task(input_dict)#process_task_with_oneshot_embedding(input_dict)
-        except Exception as e:
-            print(f"[agent] Error occurred while processing with oneshot embedding: {e}")
-            print(f"[agent] Falling back to traditional FIX workflow...")
+    try:
+        if problem_type == PROBLEM_TYPE_FIX:
             result = process_fix_task(input_dict)
-    else:
-        # Use traditional approach for CREATE tasks
-        result = process_create_task(input_dict)
+        else:
+            result = process_create_task(input_dict)
+    except Exception as e:
+        print(f"[agent] Error occurred while processing task: {e}")
+        print(f"[agent] Falling back to traditional FIX workflow...")
+        result = process_fix_task(input_dict)
 
     os.system("git reset --hard")
 
@@ -4432,11 +3785,10 @@ def process_create_task(input_dict):
     problem_statement = input_dict.get("problem_statement", "")
     problem_statement = post_process_instruction(problem_statement)
     code_skeleton = get_code_skeleton()
-    def requirement_analysis(proplem_statement: str, code_skeleton: str) -> str:
+    def requirement_analysis(problem_statement: str, code_skeleton: str) -> str:
         prompt = REQUIREMENT_ANALYSIS_PROMPT.format(
         problem_statement=problem_statement,
-        code_skeleton=code_skeleton,
-        task_type="CREATE"
+        code_skeleton=code_skeleton
             )
         messages = [
             {"role": "system", "content": "You are a expert software requirements analyst. Generate comprehensive, well-structured requirement documents that are immediately actionable for development teams."},
@@ -4450,8 +3802,7 @@ def process_create_task(input_dict):
         prompt = ARCHITECTURE_ANALYSIS_PROMPT.format(
             problem_statement=problem_statement,
             code_skeleton=code_skeleton,
-            requirement_document=requirement,
-            task_type="CREATE"
+            requirement_document=requirement
             )
         messages = [
         {
@@ -4487,7 +3838,8 @@ def process_create_task(input_dict):
         instance_id="",
         test_runner=f"unittest",
         test_runner_mode="FILE",
-        n_max_steps=100
+        n_max_steps=100,
+        step=5
     )
 
     if patch is None:
@@ -4713,195 +4065,35 @@ def process_fix_task(input_dict: Dict[str, Any]):
     problem_statement=input_dict.get("problem_statement", "")
     REPO_DIR = os.getcwd()
     set_env_for_agent()
-    code_skeleton = get_code_skeleton()
-    def requirement_analysis(proplem_statement: str, code_skeleton: str) -> str:
-        prompt = REQUIREMENT_ANALYSIS_PROMPT.format(
-        proplem_statement=proplem_statement,
-        code_skeleton=code_skeleton,
-        task_type="FIX"
-            )
-        messages = [
-            {"role": "system", "content": "Act as a expert software requirements analyst. Generate comprehensive, well-structured requirement documents that are immediately actionable for development teams."},
-            {"role": "user", "content": prompt}
-            ]
-        response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
-        return response if response else ""
-    requirement = requirement_analysis(problem_statement, code_skeleton)
-    logger.info(f"[REQUIREMENT]\n{requirement}")
-    def architecture_analyzer(problem_statement: str, code_skeleton: str, requirement: str) -> str:
-        prompt = ARCHITECTURE_ANALYSIS_PROMPT.format(
-            problem_statement=problem_statement,
-            code_skeleton=code_skeleton,
-            requirement_document=requirement,
-            task_type="FIX"
-            )
-        messages = [
-        {
-            "role": "system", 
-            "content": "Act as a principal software architect. Provide complete technical specifications without omissions or examples."
-        },
-        {
-            "role": "user", 
-            "content": prompt
-        }]
-        response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME,)
-        return response if response else ''
-    architecture = architecture_analyzer(problem_statement=problem_statement, code_skeleton=code_skeleton, requirement=requirement)
-    logger.info(f"[ARCHITECTURE]\n{architecture}")
     
     logger.info(f"Current working directory: {os.getcwd()}")
     
+    logger.info("Falling back to traditional FIX workflow...")
     try:
-        logger.info(f"About to execute embedding-based FIX workflow...")
-        
-        # Use embedding-based approach for FIX tasks
-        result = process_task_with_oneshot_embedding(input_dict)
-        
-        logger.info(f"Embedding-based workflow completed, result length: {len(result) if result else 0}")
-        
-        # Reset git state
-        os.system("git reset --hard")
-        
+        result = my_fix_task_solve_workflow(
+            input_dict.get("problem_statement", ""),
+            timeout=DEFAULT_TIMEOUT,
+            run_id_1=RUN_ID,
+            instance_id="",
+            test_runner="pytest",
+            test_runner_mode="FILE",
+            step=10 # 10 steps for fix task
+        )
         return result
-        
-    except Exception as e:
-        import traceback
-        error_info = f"Error: {e}, {traceback.format_exc()}"
-        logger.error(f"[CRITICAL] Exception in embedding-based FIX task processing: {error_info}")
-        
-        # Fallback to traditional approach if embedding fails
-        logger.info("Falling back to traditional FIX workflow...")
-        try:
-            result = fix_task_solve_workflow(
-                input_dict.get("problem_statement", ""),
-                timeout=DEFAULT_TIMEOUT,
-                run_id_1=RUN_ID,
-                instance_id="",
-                test_runner="pytest",
-                test_runner_mode="FILE"
-            )
-            return result
-        except Exception as fallback_error:
-            logger.error(f"Fallback also failed: {fallback_error}")
-            return ""
-
-def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str, instance_id: str = "", \
-    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
-    global run_id
-    run_id=run_id_1
-    cot=EnhancedCOT()
-    tool_manager=FixTaskEnhancedToolManager(
-        available_tools=[
-            "get_file_content",
-            "save_file",
-            "get_approval_for_solution",
-            "get_functions",
-            "get_classes",
-            "search_in_all_files_content",
-            "search_in_specified_file_v2",
-            "start_over",
-            "run_repo_tests",
-            "run_code",
-            "apply_code_edit",
-            "generate_test_function",
-            "finish"
-        ],
-        test_runner=test_runner,
-        test_runner_mode=test_runner_mode
-    )
-    logger.info(f"Starting main agent execution...")
-    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(),format_prompt=FORMAT_PROMPT_V0)
-    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
-    
-    start_time = time.time()
-    logs: List[str] = []
-    logs.append(f"cwd: {os.getcwd()}")
-    logger.info(f"Starting workflow execution with {n_max_steps} max steps: timeout: {timeout} seconds : run_id: {run_id}")
-    
-    for step in range(n_max_steps):
-        logger.info(f"Execution step {step + 1}/{n_max_steps}")
-        
-        if time.time() - start_time > timeout:
-            cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True,inference_error_counter={},request_data=[]))
-            break
-
-        messages: List[Dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": instance_prompt},
-            ]
-        
-        messages.extend(cot.to_str())
-
-        messages.append({"role": "system", "content": STOP_INSTRUCTION})
-    
-        if cot.is_thought_repeated():
-            logger.info(f"[TEST_PATCH_FIND] Thought repeated, adding DO NOT REPEAT TOOL CALLS instruction")
-            last_thought = cot.thoughts[-1]
-            messages.append({"role": "user", "content": DO_NOT_REPEAT_TOOL_CALLS.format(previous_response=f"next_tool_name:{last_thought.next_tool_name}\n next_tool_args:{last_thought.next_tool_args}")})
-    
-        try:
-            next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages = EnhancedNetwork.inference(messages, model=GLM_MODEL_NAME, run_id=run_id)
-        except Exception as e:
-            import traceback  # Ensure traceback is accessible
-            error_msg=f"\n\nERROR: {repr(e)} {traceback.format_exc()}"
-            logger.error(f"Inference error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=error_msg,next_tool_name="",next_tool_args={},observation="",is_error=True,raw_response=raw_text,total_attempts=total_attempts),inference_error_counter=error_counter,request_data=messages)
-            break
-        
-        logger.info(f"About to execute operation: {next_tool_name}")
-       
-        try:
-            logger.info(f"next_thought: {next_thought}\nnext_tool_name: {next_tool_name}\nnext_tool_args: {next_tool_args}\n")
-            if '"' in next_tool_name or "'" in next_tool_name:
-                next_tool_name=next_tool_name.replace('"','')
-                next_tool_name=next_tool_name.replace("'","")
-                
-            next_observation = tool_manager.get_tool(next_tool_name)(**next_tool_args) if next_tool_args else tool_manager.get_tool(next_tool_name)()
-            logger.info(f"next_observation: {next_observation}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=next_observation,is_error=False,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
-        except EnhancedToolManager.Error as e:
-            import traceback  # Ensure traceback is accessible
-            error_msg=f"observation: {e.message}"
-            logger.error(f"Tool error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
-            continue
-        except Exception as e:
-            import traceback  # Ensure traceback is accessible
-            error_traceback=traceback.format_exc()
-            if isinstance(e,TypeError):
-                error_msg=f"observation: {str(e)}"
-            else:
-                error_msg=f"observation: {repr(e)} {error_traceback}"
-            logger.error(f"Tool error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
-            continue
-        
-        if next_tool_name == "finish":
-            logger.info('[CRITICAL] Workflow called finish operation')
-            break
-        print(f"[CRITICAL] Completed step {step + 1}, continuing to next step")
-    else:
-        # This happens if we exit the loop without breaking (reached MAX_STEPS)
-        cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True))
-        logger.info(f"[CRITICAL] Workflow completed after reaching MAX_STEPS ({n_max_steps})")
-        if n_max_steps < MAX_FIX_TASK_STEPS: # This is create task case and failed with smaller fix steps so try to use original solution supposing generated testcases are wrong
-            return None
-    
-    logger.info(f"[CRITICAL] Workflow execution completed after {step + 1} steps")
-    logger.info(f"[CRITICAL] About to generate final patch...")
-    patch = tool_manager.get_final_git_patch()
-    logger.info(f"Final Patch Generated..: Length: {len(patch)}")
-
-    return patch
+    except Exception as fallback_error:
+        logger.error(f"Fallback also failed: {fallback_error}")
+        cot = EnhancedCOT()
+        result = cot.get_final_git_patch()
+        return result
 
 def my_fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str, instance_id: str = "", \
-    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
+    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS, step: int = 5) -> tuple[str, List[str], List[str]]:
     global run_id
     run_id = run_id_1
     cot = EnhancedCOT()
     
     # Initialize Enhanced CoT Controller - reads entire thoughts every 5 steps
-    cot_controller = CoTController(reflection_interval=5)
+    cot_controller = CoTController(reflection_interval=step)
     
     tool_manager = FixTaskEnhancedToolManager(
         available_tools=[
@@ -4915,7 +4107,7 @@ def my_fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1
     )
     
     logger.info(f"Starting main agent execution with Enhanced CoT Controller...")
-    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(), format_prompt=FORMAT_PROMPT_V0)
+    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(), format_prompt=FORMAT_PROMPT_V0, step=step)
     instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
     
     start_time = time.time()
@@ -4956,7 +4148,7 @@ def my_fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1
             ]
             
             try:
-                reflection_response = EnhancedNetwork.make_request(reflection_messages, model=GLM_MODEL_NAME)
+                reflection_response = EnhancedNetwork.make_request(reflection_messages, model=QWEN_MODEL_NAME)
                 strategic_guidance = cot_controller.extract_strategic_guidance(reflection_response)
                 cot_controller.update_controller_state(reflection_response, step)
                 
@@ -5005,7 +4197,7 @@ def my_fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1
             messages.append({"role": "user", "content": DO_NOT_REPEAT_TOOL_CALLS.format(previous_response=f"next_tool_name:{last_thought.next_tool_name}\n next_tool_args:{last_thought.next_tool_args}")})
     
         try:
-            next_thought, next_tool_name, next_tool_args, raw_text, total_attempts, error_counter, messages = EnhancedNetwork.inference(messages, model=GLM_MODEL_NAME, run_id=run_id)
+            next_thought, next_tool_name, next_tool_args, raw_text, total_attempts, error_counter, messages = EnhancedNetwork.inference(messages, model=QWEN_MODEL_NAME, run_id=run_id)
         except Exception as e:
             import traceback
             error_msg = f"\n\nERROR: {repr(e)} {traceback.format_exc()}"
